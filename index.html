@@ -42,9 +42,8 @@
                     </div>
                     <div class="quick-targets">
                         <span class="label">快速选择：</span>
-                        <button class="tag" data-domain="www.example.com">www.example.com</button>
-                        <button class="tag" data-domain="cdn.example.com">cdn.example.com</button>
-                        <button class="tag" data-domain="download.example.com">download.example.com</button>
+                        <button class="tag" data-domain="edgeone.ai">EdgeOne 官网</button>
+                        <button class="tag" data-domain="www.baidu.com">百度官网</button>
                     </div>
                 </div>
             </div>
@@ -248,6 +247,38 @@
                                 <label>测试状态</label>
                                 <span id="downloadResult">--</span>
                             </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 模块6: 域名连通性批量检测 -->
+            <div class="card" id="batchTestCard">
+                <div class="card-header">
+                    <h2>🏥 域名连通性检测</h2>
+                    <span class="status-badge" id="batchTestStatus">等待中</span>
+                </div>
+                <div class="card-body">
+                    <div class="batch-test-section">
+                        <h3 class="batch-group-title">腾讯域名</h3>
+                        <div class="batch-test-grid" id="tencentDomainGrid"></div>
+                    </div>
+                    <div class="batch-test-section">
+                        <h3 class="batch-group-title">其他域名</h3>
+                        <div class="batch-test-grid" id="otherDomainGrid"></div>
+                    </div>
+                    <div class="batch-summary" id="batchSummary" style="display:none;">
+                        <div class="info-item">
+                            <label>正常</label>
+                            <span id="batchNormal" class="text-success">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>异常</label>
+                            <span id="batchAbnormal" class="text-error">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>平均延迟</label>
+                            <span id="batchAvgLatency">--</span>
                         </div>
                     </div>
                 </div>

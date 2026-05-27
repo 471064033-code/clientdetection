@@ -453,6 +453,126 @@ body {
     color: var(--text-secondary);
 }
 
+/* 批量域名检测 */
+.batch-test-section {
+    margin-bottom: 20px;
+}
+
+.batch-test-section:last-of-type {
+    margin-bottom: 16px;
+}
+
+.batch-group-title {
+    font-size: 13px;
+    color: var(--text-secondary);
+    font-weight: 600;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+}
+
+.batch-test-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 8px;
+}
+
+.batch-test-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    background: var(--bg-surface);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    transition: border-color 0.2s;
+}
+
+.batch-test-item.testing {
+    border-color: var(--primary);
+    animation: pulse 1.5s infinite;
+}
+
+.batch-test-item.normal {
+    border-color: var(--success);
+}
+
+.batch-test-item.slow {
+    border-color: var(--warning);
+}
+
+.batch-test-item.error {
+    border-color: var(--error);
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+}
+
+.batch-domain-name {
+    font-size: 13px;
+    color: var(--text-primary);
+    font-weight: 500;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.batch-test-result {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.batch-latency {
+    color: var(--text-secondary);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+.batch-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-muted);
+}
+
+.batch-status-dot.normal {
+    background: var(--success);
+}
+
+.batch-status-dot.slow {
+    background: var(--warning);
+}
+
+.batch-status-dot.error {
+    background: var(--error);
+}
+
+.batch-status-dot.testing {
+    background: var(--primary);
+    animation: pulse 1s infinite;
+}
+
+.batch-summary {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+}
+
+.text-success {
+    color: var(--success) !important;
+}
+
+.text-error {
+    color: var(--error) !important;
+}
+
 /* 响应式 */
 @media (max-width: 768px) {
     #app {

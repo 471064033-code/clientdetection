@@ -26,6 +26,35 @@ const CONFIG = {
     timeout: 15000
 };
 
+// ==================== 批量域名检测配置 ====================
+const BATCH_DOMAINS = {
+    tencent: [
+        { domain: 'i.gtimg.cn', label: 'i.gtimg.cn' },
+        { domain: 'cloud.tencent.com', label: 'cloud.tencent.com' },
+        { domain: 'imgcache.qq.com', label: 'imgcache.qq.com' },
+        { domain: 'www.wechat.com', label: 'www.wechat.com' },
+        { domain: 'qzone.qq.com', label: 'qzone.qq.com' },
+        { domain: 'now.qq.com', label: 'now.qq.com' },
+        { domain: 'www.qq.com', label: 'www.qq.com' },
+        { domain: 'qianbao.qq.com', label: 'qianbao.qq.com' },
+        { domain: 'v.qq.com', label: 'v.qq.com' },
+        { domain: 'mail.qq.com', label: 'mail.qq.com' },
+        { domain: 'qun.qq.com', label: 'qun.qq.com' },
+        { domain: 'mmbiz.qpic.cn', label: 'mmbiz.qpic.cn' },
+        { domain: 'puui.qpic.cn', label: 'puui.qpic.cn' },
+        { domain: 'inews.gtimg.com', label: 'inews.gtimg.com' },
+        { domain: 'emoji.qpic.cn', label: 'emoji.qpic.cn' },
+        { domain: 'captcha.gtimg.com', label: 'captcha.gtimg.com' }
+    ],
+    other: [
+        { domain: 'www.baidu.com', label: 'www.baidu.com' },
+        { domain: 'www.youku.com', label: 'www.youku.com' },
+        { domain: 'www.zhihu.com', label: 'www.zhihu.com' },
+        { domain: 'www.iqiyi.com', label: 'www.iqiyi.com' },
+        { domain: 'www.kugou.com', label: 'www.kugou.com' }
+    ]
+};
+
 // ==================== 工具函数 ====================
 function $(selector) {
     return document.querySelector(selector);
@@ -73,11 +102,157 @@ let diagnosisResult = {
     timestamp: '',
     target: '',
     clientInfo: {},
+    batchTest: { tencent: [], other: [] },
     dns: {},
     connectivity: {},
     mtr: {},
     download: {}
 };
+
+// ==================== 模块0: 域名连通性批量检测 ====================
+function initBatchTestGrid() {
+    const tencentGrid = $('#tencentDomainGrid');
+    const otherGrid = $('#otherDomainGrid');
+    
+    tencentGrid.innerHTML = '';
+    otherGrid.innerHTML = '';
+
+    BATCH_DOMAINS.tencent.forEach(item => {
+        tencentGrid.appendChild(createBatchItem(item.domain));
+    });
+
+    BATCH_DOMAINS.other.forEach(item => {
+        otherGrid.appendChild(createBatchItem(item.domain));
+    });
+}
+
+function createBatchItem(domain) {
+    const div = document.createElement('div');
+    div.className = 'batch-test-item';
+    div.id = `batch-${domain.replace(/\./g, '-')}`;
+    div.innerHTML = `
+        <span class="batch-domain-name">${domain}</span>
+        <div class="batch-test-result">
+            <span class="batch-latency">等待中</span>
+            <span class="batch-status-dot"></span>
+        </div>
+    `;
+    return div;
+}
+
+async function detectBatchDomains() {
+    setStatus('batchTestStatus', 'running');
+    initBatchTestGrid();
+
+    const results = { tencent: [], other: [] };
+
+    // 并发检测所有域名，但用 Promise.allSettled 确保全部完成
+    const allDomains = [
+        ...BATCH_DOMAINS.tencent.map(d => ({ ...d, group: 'tencent' })),
+        ...BATCH_DOMAINS.other.map(d => ({ ...d, group: 'other' }))
+    ];
+
+    // 分批并发（每批6个，避免浏览器并发连接数限制）
+    const batchSize = 6;
+    for (let i = 0; i < allDomains.length; i += batchSize) {
+        const batch = allDomains.slice(i, i + batchSize);
+        await Promise.allSettled(
+            batch.map(item => testSingleDomain(item, results))
+        );
+    }
+
+    // 更新摘要
+    const allResults = [...results.tencent, ...results.other];
+    const normalCount = allResults.filter(r => r.status === 'normal').length;
+    const abnormalCount = allResults.filter(r => r.status === 'error').length;
+    const validLatencies = allResults.filter(r => r.latency > 0).map(r => r.latency);
+    const avgLatency = validLatencies.length > 0 
+        ? Math.round(validLatencies.reduce((a, b) => a + b, 0) / validLatencies.length)
+        : 0;
+
+    $('#batchSummary').style.display = 'grid';
+    $('#batchNormal').textContent = `${normalCount} 个`;
+    $('#batchAbnormal').textContent = `${abnormalCount} 个`;
+    $('#batchAvgLatency').textContent = `${avgLatency} ms`;
+
+    diagnosisResult.batchTest = results;
+    setStatus('batchTestStatus', 'success');
+    return true;
+}
+
+async function testSingleDomain(item, results) {
+    const domainId = `batch-${item.domain.replace(/\./g, '-')}`;
+    const el = $(`#${domainId}`);
+    if (el) el.className = 'batch-test-item testing';
+
+    const latencyEl = el ? el.querySelector('.batch-latency') : null;
+    const dotEl = el ? el.querySelector('.batch-status-dot') : null;
+
+    if (latencyEl) latencyEl.textContent = '检测中...';
+    if (dotEl) dotEl.className = 'batch-status-dot testing';
+
+    let latency = -1;
+    let status = 'error';
+    let statusText = '网络差';
+
+    try {
+        const startTime = performance.now();
+        
+        // 使用 fetch 发起请求来测量延迟
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 6000);
+        
+        await fetch(`https://${item.domain}`, {
+            method: 'HEAD',
+            mode: 'no-cors',
+            cache: 'no-store',
+            signal: controller.signal
+        });
+        
+        clearTimeout(timer);
+        latency = Math.round(performance.now() - startTime);
+        
+        if (latency < 3000) {
+            status = 'normal';
+            statusText = `网络正常，延时${latency}毫秒`;
+        } else {
+            status = 'slow';
+            statusText = `网络慢，延时${latency}毫秒`;
+        }
+    } catch (error) {
+        if (error.name === 'AbortError') {
+            latency = -1;
+            status = 'error';
+            statusText = '网络差，延迟大于6000毫秒';
+        } else {
+            // 对于no-cors模式，即使有网络错误但在短时间内返回，也可能表示网络正常
+            latency = -1;
+            status = 'error';
+            statusText = '连接失败';
+        }
+    }
+
+    // 更新 UI
+    if (el) el.className = `batch-test-item ${status}`;
+    if (dotEl) dotEl.className = `batch-status-dot ${status}`;
+    if (latencyEl) {
+        if (status === 'normal') {
+            latencyEl.textContent = `${latency}ms`;
+            latencyEl.style.color = 'var(--success)';
+        } else if (status === 'slow') {
+            latencyEl.textContent = `${latency}ms`;
+            latencyEl.style.color = 'var(--warning)';
+        } else {
+            latencyEl.textContent = '>6000ms';
+            latencyEl.style.color = 'var(--error)';
+        }
+    }
+
+    // 保存结果
+    const result = { domain: item.domain, latency, status, statusText };
+    results[item.group].push(result);
+}
+
 
 // ==================== 模块1: 客户端信息采集 ====================
 async function detectClientInfo() {
@@ -86,6 +261,7 @@ async function detectClientInfo() {
     try {
         // 获取IP和地理信息
         let ipData = null;
+        let ipFetchFailed = false;
 
         // 尝试 ip-api.com
         try {
@@ -108,15 +284,42 @@ async function detectClientInfo() {
             try {
                 const resp = await fetchWithTimeout(CONFIG.ipApis[0]);
                 const data = await resp.json();
-                ipData = {
-                    ip: data.ip,
-                    location: `${data.country} ${data.region} ${data.city}`,
-                    isp: data.org,
-                    as: ''
-                };
+                if (data.ip) {
+                    ipData = {
+                        ip: data.ip,
+                        location: `${data.country} ${data.region} ${data.city}`,
+                        isp: data.org,
+                        as: ''
+                    };
+                } else {
+                    ipFetchFailed = true;
+                }
             } catch (e) {
-                ipData = { ip: '获取失败', location: '未知', isp: '未知', as: '' };
+                ipFetchFailed = true;
             }
+        }
+
+        // 如果获取不到公网IP，提醒用户并中止探测
+        if (ipFetchFailed || !ipData) {
+            $('#clientIP').textContent = '获取失败';
+            $('#clientLocation').textContent = '--';
+            $('#clientISP').textContent = '--';
+            $('#clientBrowser').textContent = detectBrowser(navigator.userAgent);
+            $('#clientOS').textContent = detectOS(navigator.userAgent);
+            $('#clientNetwork').textContent = getNetworkType();
+
+            diagnosisResult.clientInfo = {
+                ip: '获取失败',
+                location: '--',
+                isp: '--',
+                browser: detectBrowser(navigator.userAgent),
+                os: detectOS(navigator.userAgent),
+                networkType: getNetworkType()
+            };
+
+            setStatus('clientInfoStatus', 'error', '失败');
+            showToast('⚠️ 无法获取公网IP，请检查网络连接后重试');
+            return false;
         }
 
         // 浏览器和系统信息
@@ -145,6 +348,7 @@ async function detectClientInfo() {
     } catch (error) {
         setStatus('clientInfoStatus', 'error', '失败');
         console.error('Client info detection failed:', error);
+        showToast('⚠️ 无法获取公网IP，请检查网络连接后重试');
         return false;
     }
 }
@@ -643,6 +847,31 @@ ${subDivider}
   首字节时间:   ${r.download.ttfb}
   测试结果:     ${r.download.success ? '成功' : '失败'}
 
+${subDivider}
+【6】域名连通性检测
+${subDivider}
+  ── 腾讯域名 ──
+`;
+
+    if (r.batchTest && r.batchTest.tencent) {
+        r.batchTest.tencent.forEach(item => {
+            const statusIcon = item.status === 'normal' ? '✓' : item.status === 'slow' ? '△' : '✗';
+            const latencyStr = item.latency > 0 ? `${item.latency}ms` : '>6000ms';
+            report += `  ${statusIcon} ${item.domain.padEnd(22)} ${latencyStr.padStart(8)}  ${item.statusText}\n`;
+        });
+    }
+
+    report += `\n  ── 其他域名 ──\n`;
+
+    if (r.batchTest && r.batchTest.other) {
+        r.batchTest.other.forEach(item => {
+            const statusIcon = item.status === 'normal' ? '✓' : item.status === 'slow' ? '△' : '✗';
+            const latencyStr = item.latency > 0 ? `${item.latency}ms` : '>6000ms';
+            report += `  ${statusIcon} ${item.domain.padEnd(22)} ${latencyStr.padStart(8)}  ${item.statusText}\n`;
+        });
+    }
+
+    report += `
 ${divider}
   报告结束
 ${divider}
@@ -681,18 +910,51 @@ async function startDiagnosis() {
 
     const steps = [
         { name: '采集客户端信息', weight: 15 },
-        { name: 'DNS 解析诊断', weight: 25 },
-        { name: '节点连通性检测', weight: 20 },
-        { name: 'MTR 路由追踪', weight: 25 },
-        { name: '下载速度测试', weight: 15 }
+        { name: 'DNS 解析诊断', weight: 20 },
+        { name: '节点连通性检测', weight: 15 },
+        { name: 'MTR 路由追踪', weight: 20 },
+        { name: '下载速度测试', weight: 15 },
+        { name: '域名连通性检测', weight: 15 }
     ];
 
     let progress = 0;
 
     // Step 1: 客户端信息
     updateProgress(progress, steps[0].name);
-    await detectClientInfo();
+    const clientInfoOk = await detectClientInfo();
     progress += steps[0].weight;
+
+    // 如果获取不到公网IP，中止后续探测
+    if (!clientInfoOk) {
+        updateProgress(progress, '⚠️ 无法获取公网IP，探测已中止');
+        $('#progressSection').style.display = 'none';
+        
+        // 显示提示信息
+        const alertDiv = document.createElement('div');
+        alertDiv.className = 'ip-fail-alert';
+        alertDiv.innerHTML = `
+            <div style="background: var(--card-bg); border: 1px solid var(--error); border-radius: 12px; padding: 20px; margin: 16px 0; text-align: center;">
+                <div style="font-size: 32px; margin-bottom: 12px;">⚠️</div>
+                <div style="font-size: 16px; font-weight: 600; color: var(--error); margin-bottom: 8px;">无法获取公网IP</div>
+                <div style="font-size: 14px; color: var(--text-secondary); line-height: 1.6;">
+                    未能获取到您的公网IP地址，后续网络探测无法继续。<br>
+                    请检查您的网络连接是否正常，或稍后重试。
+                </div>
+            </div>
+        `;
+        // 移除之前的告警（如果有）
+        const oldAlert = document.querySelector('.ip-fail-alert');
+        if (oldAlert) oldAlert.remove();
+        $('#resultsSection').insertBefore(alertDiv, $('#resultsSection').firstChild);
+
+        isRunning = false;
+        $('#startDiagnosis').disabled = false;
+        return;
+    }
+
+    // 移除之前可能存在的IP获取失败告警
+    const oldAlert = document.querySelector('.ip-fail-alert');
+    if (oldAlert) oldAlert.remove();
 
     // Step 2: DNS解析
     updateProgress(progress, steps[1].name);
@@ -713,6 +975,11 @@ async function startDiagnosis() {
     updateProgress(progress, steps[4].name);
     await detectDownloadSpeed(cleanDomain);
     progress += steps[4].weight;
+
+    // Step 6: 批量域名连通性检测
+    updateProgress(progress, steps[5].name);
+    await detectBatchDomains();
+    progress += steps[5].weight;
 
     // 完成
     updateProgress(100, '诊断完成');
