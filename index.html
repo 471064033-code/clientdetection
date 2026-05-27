@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>客户端网络诊断工具</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- 头部 -->
+        <header class="header">
+            <div class="header-content">
+                <div class="logo">
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+                    </svg>
+                    <h1>网络诊断工具</h1>
+                </div>
+                <div class="header-info">
+                    <span class="badge">v1.0</span>
+                    <span class="time" id="currentTime"></span>
+                </div>
+            </div>
+        </header>
+
+        <!-- 目标域名输入 -->
+        <section class="target-section">
+            <div class="card">
+                <div class="card-header">
+                    <h2>🎯 诊断目标</h2>
+                </div>
+                <div class="card-body">
+                    <div class="input-group">
+                        <input type="text" id="targetDomain" placeholder="请输入要诊断的域名，如 www.example.com" value="">
+                        <button id="startDiagnosis" class="btn btn-primary">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polygon points="5 3 19 12 5 21 5 3"/>
+                            </svg>
+                            开始诊断
+                        </button>
+                    </div>
+                    <div class="quick-targets">
+                        <span class="label">快速选择：</span>
+                        <button class="tag" data-domain="www.example.com">www.example.com</button>
+                        <button class="tag" data-domain="cdn.example.com">cdn.example.com</button>
+                        <button class="tag" data-domain="download.example.com">download.example.com</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 诊断进度 -->
+        <section class="progress-section" id="progressSection" style="display:none;">
+            <div class="card">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+                <div class="progress-text" id="progressText">正在初始化诊断...</div>
+            </div>
+        </section>
+
+        <!-- 诊断结果区域 -->
+        <section class="results-section" id="resultsSection" style="display:none;">
+            
+            <!-- 模块1: 客户端信息 -->
+            <div class="card" id="clientInfoCard">
+                <div class="card-header">
+                    <h2>📍 客户端信息</h2>
+                    <span class="status-badge" id="clientInfoStatus">等待中</span>
+                </div>
+                <div class="card-body">
+                    <div class="info-grid">
+                        <div class="info-item">
+                            <label>客户端 IP</label>
+                            <span id="clientIP">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>地理位置</label>
+                            <span id="clientLocation">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>运营商</label>
+                            <span id="clientISP">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>浏览器</label>
+                            <span id="clientBrowser">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>操作系统</label>
+                            <span id="clientOS">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>网络类型</label>
+                            <span id="clientNetwork">--</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 模块2: DNS 解析 -->
+            <div class="card" id="dnsCard">
+                <div class="card-header">
+                    <h2>🌐 DNS 解析</h2>
+                    <span class="status-badge" id="dnsStatus">等待中</span>
+                </div>
+                <div class="card-body">
+                    <div class="dns-summary" id="dnsSummary">
+                        <div class="info-item">
+                            <label>解析域名</label>
+                            <span id="dnsDomain">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>CNAME</label>
+                            <span id="dnsCname">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>解析耗时</label>
+                            <span id="dnsTime">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>Local DNS</label>
+                            <span id="localDns">--</span>
+                        </div>
+                    </div>
+                    <div class="table-container">
+                        <table class="data-table" id="dnsTable">
+                            <thead>
+                                <tr>
+                                    <th>记录类型</th>
+                                    <th>解析结果</th>
+                                    <th>TTL</th>
+                                    <th>节点归属</th>
+                                </tr>
+                            </thead>
+                            <tbody id="dnsTableBody">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 模块3: 节点连通性 -->
+            <div class="card" id="connectCard">
+                <div class="card-header">
+                    <h2>🔗 节点连通性</h2>
+                    <span class="status-badge" id="connectStatus">等待中</span>
+                </div>
+                <div class="card-body">
+                    <div class="connect-summary">
+                        <div class="info-item">
+                            <label>HTTP 状态码</label>
+                            <span id="httpStatus">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>响应时间</label>
+                            <span id="responseTime">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>SSL 证书</label>
+                            <span id="sslInfo">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>CDN 节点</label>
+                            <span id="cdnNode">--</span>
+                        </div>
+                    </div>
+                    <div class="response-headers" id="responseHeaders" style="display:none;">
+                        <h4>响应头信息</h4>
+                        <pre id="headersContent"></pre>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 模块4: MTR 路由追踪 -->
+            <div class="card" id="mtrCard">
+                <div class="card-header">
+                    <h2>🛤️ MTR 路由追踪</h2>
+                    <span class="status-badge" id="mtrStatus">等待中</span>
+                </div>
+                <div class="card-body">
+                    <div class="mtr-info">
+                        <div class="info-item">
+                            <label>目标 IP</label>
+                            <span id="mtrTarget">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>总跳数</label>
+                            <span id="mtrHops">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>丢包率</label>
+                            <span id="mtrLoss">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>平均延迟</label>
+                            <span id="mtrAvgLatency">--</span>
+                        </div>
+                    </div>
+                    <div class="table-container">
+                        <table class="data-table" id="mtrTable">
+                            <thead>
+                                <tr>
+                                    <th>跳数</th>
+                                    <th>IP 地址</th>
+                                    <th>主机名</th>
+                                    <th>丢包率</th>
+                                    <th>已发送</th>
+                                    <th>最小延迟</th>
+                                    <th>平均延迟</th>
+                                    <th>最大延迟</th>
+                                </tr>
+                            </thead>
+                            <tbody id="mtrTableBody">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 模块5: 下载测速 -->
+            <div class="card" id="downloadCard">
+                <div class="card-header">
+                    <h2>⬇️ 下载测速</h2>
+                    <span class="status-badge" id="downloadStatus">等待中</span>
+                </div>
+                <div class="card-body">
+                    <div class="download-result">
+                        <div class="speed-display">
+                            <div class="speed-value" id="downloadSpeed">--</div>
+                            <div class="speed-unit">Mbps</div>
+                        </div>
+                        <div class="download-details">
+                            <div class="info-item">
+                                <label>测试文件大小</label>
+                                <span id="testFileSize">--</span>
+                            </div>
+                            <div class="info-item">
+                                <label>下载耗时</label>
+                                <span id="downloadTime">--</span>
+                            </div>
+                            <div class="info-item">
+                                <label>首字节时间(TTFB)</label>
+                                <span id="ttfb">--</span>
+                            </div>
+                            <div class="info-item">
+                                <label>测试状态</label>
+                                <span id="downloadResult">--</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </section>
+
+        <!-- 底部操作 -->
+        <section class="action-section" id="actionSection" style="display:none;">
+            <div class="card">
+                <div class="card-body action-bar">
+                    <button id="copyReport" class="btn btn-success">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                        </svg>
+                        一键复制诊断报告
+                    </button>
+                    <button id="retestBtn" class="btn btn-secondary">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="23 4 23 10 17 10"/>
+                            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+                        </svg>
+                        重新诊断
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- 诊断报告预览 -->
+        <section class="report-section" id="reportSection" style="display:none;">
+            <div class="card">
+                <div class="card-header">
+                    <h2>📋 诊断报告</h2>
+                    <button class="btn btn-sm" id="closeReport">关闭</button>
+                </div>
+                <div class="card-body">
+                    <pre id="reportContent" class="report-content"></pre>
+                </div>
+            </div>
+        </section>
+
+    </div>
+
+    <script src="diagnosis.js"></script>
+</body>
+</html>
