@@ -255,58 +255,95 @@ async function testSingleDomain(item, results) {
 
 
 // ==================== 模块1: 客户端信息采集 ====================
+
+// 通过 WebRTC 获取本地局域网 IP
+function getLocalIPViaWebRTC() {
+    return new Promise((resolve) => {
+        const localIPs = [];
+        try {
+            const pc = new RTCPeerConnection({ iceServers: [] });
+            pc.createDataChannel('');
+            pc.createOffer().then(offer => pc.setLocalDescription(offer));
+            pc.onicecandidate = (event) => {
+                if (!event || !event.candidate) {
+                    pc.close();
+                    resolve(localIPs);
+                    return;
+                }
+                const parts = event.candidate.candidate.split(' ');
+                const ip = parts[4];
+                if (ip && !ip.includes(':') && ip !== '0.0.0.0' && !localIPs.includes(ip)) {
+                    localIPs.push(ip);
+                }
+            };
+            // 超时保底
+            setTimeout(() => { pc.close(); resolve(localIPs); }, 3000);
+        } catch (e) {
+            resolve(localIPs);
+        }
+    });
+}
+
+// 从多个 API 获取出口IP，用于对比检测代理
+async function getExitIPs() {
+    const results = [];
+
+    // 源1: ip-api.com
+    try {
+        const resp = await fetchWithTimeout(CONFIG.ipApis[1], {}, 8000);
+        const data = await resp.json();
+        if (data.status === 'success') {
+            results.push({
+                source: 'ip-api.com',
+                ip: data.query,
+                location: `${data.country} ${data.regionName} ${data.city}`,
+                isp: data.isp || data.org,
+                as: data.as
+            });
+        }
+    } catch (e) {
+        console.warn('ip-api.com failed');
+    }
+
+    // 源2: ipinfo.io
+    try {
+        const resp = await fetchWithTimeout(CONFIG.ipApis[0], {}, 8000);
+        const data = await resp.json();
+        if (data.ip) {
+            results.push({
+                source: 'ipinfo.io',
+                ip: data.ip,
+                location: `${data.country || ''} ${data.region || ''} ${data.city || ''}`.trim(),
+                isp: data.org || '',
+                as: ''
+            });
+        }
+    } catch (e) {
+        console.warn('ipinfo.io failed');
+    }
+
+    return results;
+}
+
 async function detectClientInfo() {
     setStatus('clientInfoStatus', 'running');
 
     try {
-        // 获取IP和地理信息
-        let ipData = null;
-        let ipFetchFailed = false;
+        // 并行获取：出口IP + 本地WebRTC IP
+        const [exitIPs, localIPs] = await Promise.all([
+            getExitIPs(),
+            getLocalIPViaWebRTC()
+        ]);
 
-        // 尝试 ip-api.com
-        try {
-            const resp = await fetchWithTimeout(CONFIG.ipApis[1]);
-            const data = await resp.json();
-            if (data.status === 'success') {
-                ipData = {
-                    ip: data.query,
-                    location: `${data.country} ${data.regionName} ${data.city}`,
-                    isp: data.isp || data.org,
-                    as: data.as
-                };
-            }
-        } catch (e) {
-            console.warn('ip-api failed, trying ipinfo.io');
-        }
-
-        // 备用: ipinfo.io
-        if (!ipData) {
-            try {
-                const resp = await fetchWithTimeout(CONFIG.ipApis[0]);
-                const data = await resp.json();
-                if (data.ip) {
-                    ipData = {
-                        ip: data.ip,
-                        location: `${data.country} ${data.region} ${data.city}`,
-                        isp: data.org,
-                        as: ''
-                    };
-                } else {
-                    ipFetchFailed = true;
-                }
-            } catch (e) {
-                ipFetchFailed = true;
-            }
-        }
-
-        // 如果获取不到公网IP，提醒用户并中止探测
-        if (ipFetchFailed || !ipData) {
+        // 如果所有源都获取失败
+        if (exitIPs.length === 0) {
             $('#clientIP').textContent = '获取失败';
             $('#clientLocation').textContent = '--';
             $('#clientISP').textContent = '--';
             $('#clientBrowser').textContent = detectBrowser(navigator.userAgent);
             $('#clientOS').textContent = detectOS(navigator.userAgent);
             $('#clientNetwork').textContent = getNetworkType();
+            $('#proxyInfo').textContent = '--';
 
             diagnosisResult.clientInfo = {
                 ip: '获取失败',
@@ -314,12 +351,47 @@ async function detectClientInfo() {
                 isp: '--',
                 browser: detectBrowser(navigator.userAgent),
                 os: detectOS(navigator.userAgent),
-                networkType: getNetworkType()
+                networkType: getNetworkType(),
+                proxyDetected: false,
+                localIPs: localIPs
             };
 
             setStatus('clientInfoStatus', 'error', '失败');
             showToast('⚠️ 无法获取公网IP，请检查网络连接后重试');
             return false;
+        }
+
+        // 主IP数据（以第一个成功的为准）
+        const primaryIP = exitIPs[0];
+
+        // 代理检测逻辑：
+        // 1. 对比多个IP源返回的IP是否一致（不一致说明可能有分流代理）
+        // 2. 检查出口IP是否为已知代理/VPN特征
+        let proxyDetected = false;
+        let proxyIP = '';
+        let realExitIP = primaryIP.ip;
+        const uniqueIPs = [...new Set(exitIPs.map(r => r.ip))];
+
+        if (uniqueIPs.length > 1) {
+            // 多个API返回不同IP，可能存在代理分流
+            proxyDetected = true;
+            proxyIP = uniqueIPs.join(' / ');
+        }
+
+        // 检查本地IP特征：如果局域网IP属于常见VPN段（10.x, 172.16-31, 100.64-127等CGNAT）
+        const vpnLocalPatterns = [
+            /^10\.\d+\.\d+\.\d+$/,        // 10.0.0.0/8 常见VPN
+            /^100\.(6[4-9]|[7-9]\d|1[0-2]\d)\.\d+\.\d+$/, // 100.64.0.0/10 CGNAT
+            /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/ // 172.16-31 私有网段
+        ];
+        const localIPStr = localIPs.join(', ') || '未获取到';
+        const hasVpnLocalIP = localIPs.some(ip => 
+            vpnLocalPatterns.some(pattern => pattern.test(ip)) && 
+            !/^192\.168\./.test(ip) // 192.168 是普通家庭网络，不算
+        );
+
+        if (hasVpnLocalIP) {
+            proxyDetected = true;
         }
 
         // 浏览器和系统信息
@@ -329,18 +401,35 @@ async function detectClientInfo() {
         const networkType = getNetworkType();
 
         // 更新UI
-        $('#clientIP').textContent = ipData.ip;
-        $('#clientLocation').textContent = ipData.location;
-        $('#clientISP').textContent = ipData.isp;
+        $('#clientIP').textContent = primaryIP.ip;
+        $('#clientLocation').textContent = primaryIP.location;
+        $('#clientISP').textContent = primaryIP.isp;
         $('#clientBrowser').textContent = browser;
         $('#clientOS').textContent = os;
         $('#clientNetwork').textContent = networkType;
 
+        // 代理信息展示
+        if (proxyDetected) {
+            $('#proxyInfo').innerHTML = `<span style="color:var(--warning)">⚠️ 检测到代理</span>`;
+            $('#proxyDetails').style.display = 'block';
+            $('#proxyExitIP').textContent = proxyIP || primaryIP.ip;
+            $('#localExitIP').textContent = localIPStr;
+        } else {
+            $('#proxyInfo').innerHTML = `<span style="color:var(--success)">未检测到代理</span>`;
+            $('#proxyDetails').style.display = 'block';
+            $('#proxyExitIP').textContent = '无 (直连)';
+            $('#localExitIP').textContent = localIPStr;
+        }
+
         diagnosisResult.clientInfo = {
-            ip: ipData.ip,
-            location: ipData.location,
-            isp: ipData.isp,
-            browser, os, networkType
+            ip: primaryIP.ip,
+            location: primaryIP.location,
+            isp: primaryIP.isp,
+            browser, os, networkType,
+            proxyDetected,
+            proxyIP: proxyIP || '',
+            localIPs: localIPs,
+            allExitIPs: exitIPs.map(r => r.ip)
         };
 
         setStatus('clientInfoStatus', 'success');
@@ -378,14 +467,42 @@ function detectOS(ua) {
 function getNetworkType() {
     const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
     if (!conn) return '未知';
-    const type = conn.effectiveType || conn.type;
+
+    // 优先使用 connection.type（真实物理连接类型）
+    const physicalType = conn.type;
+    const effectiveType = conn.effectiveType;
     const downlink = conn.downlink;
-    if (type === '4g') return `4G (${downlink}Mbps)`;
-    if (type === '3g') return `3G (${downlink}Mbps)`;
-    if (type === '2g') return '2G';
-    if (type === 'wifi') return 'Wi-Fi';
-    if (type === 'ethernet') return '有线网络';
-    return type || '未知';
+
+    // 判断是否为桌面设备
+    const isDesktop = !/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+
+    // 如果物理类型明确，优先使用
+    if (physicalType === 'wifi') return `Wi-Fi${downlink ? ' (' + downlink + 'Mbps)' : ''}`;
+    if (physicalType === 'ethernet') return `有线网络${downlink ? ' (' + downlink + 'Mbps)' : ''}`;
+    if (physicalType === 'cellular') {
+        // 移动蜂窝网络，用 effectiveType 进一步区分
+        if (effectiveType === '4g') return `4G (${downlink}Mbps)`;
+        if (effectiveType === '3g') return `3G (${downlink}Mbps)`;
+        if (effectiveType === '2g') return '2G';
+        return `蜂窝网络 (${downlink}Mbps)`;
+    }
+
+    // 桌面设备 + effectiveType 为 4g/3g 时，更可能是 Wi-Fi 或有线
+    // 因为桌面浏览器大多不支持 connection.type，只有 effectiveType
+    if (isDesktop) {
+        if (effectiveType === '4g' && downlink >= 10) return `Wi-Fi/有线 (${downlink}Mbps)`;
+        if (effectiveType === '4g') return `Wi-Fi (${downlink}Mbps)`;
+        if (effectiveType === '3g') return `Wi-Fi (弱信号, ${downlink}Mbps)`;
+        if (effectiveType === '2g') return `网络极慢 (${downlink}Mbps)`;
+        return effectiveType ? `网络连接 (${downlink}Mbps)` : '未知';
+    }
+
+    // 移动设备，但 physicalType 不明确，用 effectiveType
+    if (effectiveType === '4g') return `4G (${downlink}Mbps)`;
+    if (effectiveType === '3g') return `3G (${downlink}Mbps)`;
+    if (effectiveType === '2g') return '2G';
+
+    return effectiveType || physicalType || '未知';
 }
 
 // ==================== 模块2: DNS 解析 ====================
@@ -777,12 +894,15 @@ ${divider}
 ${subDivider}
 【1】客户端信息
 ${subDivider}
-  客户端 IP: ${r.clientInfo.ip}
-  地理位置:  ${r.clientInfo.location}
-  运营商:    ${r.clientInfo.isp}
-  浏览器:    ${r.clientInfo.browser}
-  操作系统:  ${r.clientInfo.os}
-  网络类型:  ${r.clientInfo.networkType}
+  出口 IP:    ${r.clientInfo.ip}
+  地理位置:   ${r.clientInfo.location}
+  运营商:     ${r.clientInfo.isp}
+  代理状态:   ${r.clientInfo.proxyDetected ? '⚠️ 检测到代理' : '无代理 (直连)'}
+  代理出口IP: ${r.clientInfo.proxyIP || '无'}
+  本地网络IP: ${r.clientInfo.localIPs && r.clientInfo.localIPs.length > 0 ? r.clientInfo.localIPs.join(', ') : '未获取到'}
+  浏览器:     ${r.clientInfo.browser}
+  操作系统:   ${r.clientInfo.os}
+  网络类型:   ${r.clientInfo.networkType}
 
 ${subDivider}
 【2】DNS 解析

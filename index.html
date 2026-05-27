@@ -71,7 +71,7 @@
                 <div class="card-body">
                     <div class="info-grid">
                         <div class="info-item">
-                            <label>客户端 IP</label>
+                            <label>出口 IP</label>
                             <span id="clientIP">--</span>
                         </div>
                         <div class="info-item">
@@ -81,6 +81,10 @@
                         <div class="info-item">
                             <label>运营商</label>
                             <span id="clientISP">--</span>
+                        </div>
+                        <div class="info-item">
+                            <label>代理状态</label>
+                            <span id="proxyInfo">--</span>
                         </div>
                         <div class="info-item">
                             <label>浏览器</label>
@@ -93,6 +97,19 @@
                         <div class="info-item">
                             <label>网络类型</label>
                             <span id="clientNetwork">--</span>
+                        </div>
+                    </div>
+                    <!-- 代理/本地IP详情 -->
+                    <div class="proxy-details" id="proxyDetails" style="display:none;">
+                        <div class="proxy-detail-grid">
+                            <div class="info-item">
+                                <label>代理出口 IP</label>
+                                <span id="proxyExitIP">--</span>
+                            </div>
+                            <div class="info-item">
+                                <label>本地网络 IP</label>
+                                <span id="localExitIP">--</span>
+                            </div>
                         </div>
                     </div>
                 </div>

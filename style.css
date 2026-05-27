@@ -653,3 +653,29 @@ body {
     from { opacity: 1; }
     to { opacity: 0; }
 }
+
+/* 代理检测详情样式 */
+.proxy-details {
+    margin-top: 12px;
+    padding: 12px 16px;
+    background: var(--bg-secondary, #f6f8fa);
+    border-radius: 8px;
+    border: 1px dashed var(--border, #d0d7de);
+}
+
+.proxy-detail-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+}
+
+.proxy-details .info-item label {
+    font-size: 12px;
+    color: var(--text-muted, #656d76);
+}
+
+.proxy-details .info-item span {
+    font-size: 13px;
+    font-family: 'SF Mono', 'Cascadia Code', monospace;
+    word-break: break-all;
+}
