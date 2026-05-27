@@ -1005,8 +1005,27 @@ document.addEventListener('DOMContentLoaded', () => {
     updateTime();
     setInterval(updateTime, 1000);
 
+    // 从URL参数中读取域名
+    // 支持格式：?domain=www.example.com 或 ?domain=www.example.com&auto=1（自动开始诊断）
+    const urlParams = new URLSearchParams(window.location.search);
+    const urlDomain = urlParams.get('domain');
+    const autoStart = urlParams.get('auto');
+
+    if (urlDomain) {
+        // 去除协议前缀和尾部斜杠，只保留纯域名
+        const cleanDomain = urlDomain.replace(/^https?:\/\//, '').replace(/\/.*$/, '').trim();
+        if (cleanDomain) {
+            $('#targetDomain').value = cleanDomain;
+        }
+    }
+
     // 开始诊断
     $('#startDiagnosis').addEventListener('click', startDiagnosis);
+
+    // 如果URL带了auto=1参数，自动开始诊断
+    if (urlDomain && autoStart === '1') {
+        setTimeout(() => startDiagnosis(), 500);
+    }
 
     // 回车触发
     $('#targetDomain').addEventListener('keydown', (e) => {
