@@ -284,6 +284,149 @@ function getLocalIPViaWebRTC() {
     });
 }
 
+// ===== 增强代理检测：DNS泄露 + 企业代理IP段 + 时延异常 =====
+
+// 已知企业级正向代理/VPN 出口IP段特征
+const KNOWN_PROXY_PATTERNS = {
+    // 腾讯 iOA 常见出口段（深圳/上海/北京办公出口）
+    tencent_ioa: [
+        /^113\.96\./, /^183\.3\./, /^183\.47\./, /^14\.17\./, /^14\.18\./,
+        /^59\.37\./, /^58\.251\./, /^121\.51\./, /^203\.205\./
+    ],
+    // 企业常见出口特征关键词
+    enterprise_isp_keywords: [
+        'Tencent', 'tencent', '腾讯', 'iOA', 'Zero Trust',
+        'Corporate', 'Enterprise', 'Zscaler', 'Palo Alto', 'Fortinet',
+        'Cloudflare WARP', 'Tailscale'
+    ]
+};
+
+// DNS泄露检测：通过 DNS 查询对比检测透明代理
+async function detectDNSLeak() {
+    const results = {
+        dnsServers: [],
+        leakDetected: false,
+        detail: ''
+    };
+
+    try {
+        // 利用 DNS leak test 原理：请求一个带随机子域名的地址
+        // 通过多个 DoH 服务对比，看 DNS 请求是从哪里发出的
+        
+        // 方法1：通过 doh.pub 查看 edns-client-subnet（ECS）
+        try {
+            const randomSub = `leak-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            const resp = await fetchWithTimeout(
+                `https://doh.pub/dns-query?name=${randomSub}.test-dns.com&type=A`,
+                { headers: { 'Accept': 'application/dns-json' } },
+                5000
+            );
+            const data = await resp.json();
+            // doh.pub 会在 Comment 中返回客户端来源信息
+            if (data.Comment) {
+                results.dnsServers.push({ source: 'doh.pub', info: data.Comment });
+            }
+        } catch (e) { /* 忽略 */ }
+
+        // 方法2：通过 Cloudflare trace 获取 DNS 相关信息
+        try {
+            const resp = await fetchWithTimeout('https://1.1.1.1/cdn-cgi/trace', {}, 5000);
+            const text = await resp.text();
+            const lines = text.split('\n');
+            const cfData = {};
+            lines.forEach(line => {
+                const [key, value] = line.split('=');
+                if (key && value) cfData[key.trim()] = value.trim();
+            });
+            if (cfData.ip) {
+                results.dnsServers.push({ 
+                    source: 'Cloudflare', 
+                    ip: cfData.ip,
+                    loc: cfData.loc || '',
+                    colo: cfData.colo || '' // Cloudflare 数据中心代号
+                });
+            }
+        } catch (e) { /* 忽略 */ }
+
+        // 方法3：通过 ip.sb / myip.la 等获取另一个视角的出口IP
+        try {
+            const resp = await fetchWithTimeout('https://api.ip.sb/jsonip', {}, 5000);
+            const data = await resp.json();
+            if (data.ip) {
+                results.dnsServers.push({ source: 'ip.sb', ip: data.ip });
+            }
+        } catch (e) { /* 忽略 */ }
+
+    } catch (e) {
+        console.warn('DNS leak detection failed:', e);
+    }
+
+    return results;
+}
+
+// 检查出口IP是否匹配已知企业代理特征
+function checkKnownProxyIP(ip, isp) {
+    const matched = { isProxy: false, type: '', detail: '' };
+
+    // 检查IP段
+    for (const pattern of KNOWN_PROXY_PATTERNS.tencent_ioa) {
+        if (pattern.test(ip)) {
+            matched.isProxy = true;
+            matched.type = '腾讯 iOA/企业出口';
+            matched.detail = `IP ${ip} 匹配腾讯企业出口段`;
+            return matched;
+        }
+    }
+
+    // 检查ISP关键词
+    if (isp) {
+        for (const keyword of KNOWN_PROXY_PATTERNS.enterprise_isp_keywords) {
+            if (isp.includes(keyword)) {
+                matched.isProxy = true;
+                matched.type = '企业代理/VPN';
+                matched.detail = `ISP "${isp}" 包含企业代理特征关键词 "${keyword}"`;
+                return matched;
+            }
+        }
+    }
+
+    return matched;
+}
+
+// 时延异常检测：对比直连延迟和API延迟
+async function detectLatencyAnomaly() {
+    const timings = [];
+
+    // 测量到多个公共服务的延迟
+    const targets = [
+        { url: 'https://www.baidu.com', name: '百度' },
+        { url: 'https://www.qq.com', name: '腾讯' }
+    ];
+
+    for (const target of targets) {
+        try {
+            const start = performance.now();
+            await fetch(target.url, { method: 'HEAD', mode: 'no-cors', cache: 'no-store' });
+            const elapsed = performance.now() - start;
+            timings.push({ name: target.name, latency: elapsed });
+        } catch (e) {
+            timings.push({ name: target.name, latency: -1 });
+        }
+    }
+
+    // 如果所有延迟都 > 200ms，可能经过了代理跳转（国内直连通常 < 100ms）
+    const validTimings = timings.filter(t => t.latency > 0);
+    const avgLatency = validTimings.length > 0
+        ? validTimings.reduce((sum, t) => sum + t.latency, 0) / validTimings.length
+        : 0;
+
+    return {
+        timings,
+        avgLatency: Math.round(avgLatency),
+        anomaly: avgLatency > 300 // 超过300ms视为异常
+    };
+}
+
 // 从多个 API 获取出口IP，用于对比检测代理
 async function getExitIPs() {
     const results = [];
@@ -329,10 +472,12 @@ async function detectClientInfo() {
     setStatus('clientInfoStatus', 'running');
 
     try {
-        // 并行获取：出口IP + 本地WebRTC IP
-        const [exitIPs, localIPs] = await Promise.all([
+        // 并行获取：出口IP + 本地WebRTC IP + DNS泄露检测 + 时延异常
+        const [exitIPs, localIPs, dnsLeakResult, latencyResult] = await Promise.all([
             getExitIPs(),
-            getLocalIPViaWebRTC()
+            getLocalIPViaWebRTC(),
+            detectDNSLeak(),
+            detectLatencyAnomaly()
         ]);
 
         // 如果所有源都获取失败
@@ -364,34 +509,70 @@ async function detectClientInfo() {
         // 主IP数据（以第一个成功的为准）
         const primaryIP = exitIPs[0];
 
-        // 代理检测逻辑：
-        // 1. 对比多个IP源返回的IP是否一致（不一致说明可能有分流代理）
-        // 2. 检查出口IP是否为已知代理/VPN特征
+        // === 多维度代理检测 ===
         let proxyDetected = false;
+        let proxyType = '';
         let proxyIP = '';
-        let realExitIP = primaryIP.ip;
+        const proxyEvidence = []; // 收集所有代理证据
         const uniqueIPs = [...new Set(exitIPs.map(r => r.ip))];
 
+        // 检测1: 多源IP不一致 → 分流代理
         if (uniqueIPs.length > 1) {
-            // 多个API返回不同IP，可能存在代理分流
             proxyDetected = true;
+            proxyType = '分流代理';
             proxyIP = uniqueIPs.join(' / ');
+            proxyEvidence.push(`多源出口IP不一致: ${proxyIP}`);
         }
 
-        // 检查本地IP特征：如果局域网IP属于常见VPN段（10.x, 172.16-31, 100.64-127等CGNAT）
+        // 检测2: WebRTC本地IP为VPN网段
         const vpnLocalPatterns = [
-            /^10\.\d+\.\d+\.\d+$/,        // 10.0.0.0/8 常见VPN
-            /^100\.(6[4-9]|[7-9]\d|1[0-2]\d)\.\d+\.\d+$/, // 100.64.0.0/10 CGNAT
-            /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/ // 172.16-31 私有网段
+            /^10\.\d+\.\d+\.\d+$/,
+            /^100\.(6[4-9]|[7-9]\d|1[0-2]\d)\.\d+\.\d+$/,
+            /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/
         ];
         const localIPStr = localIPs.join(', ') || '未获取到';
-        const hasVpnLocalIP = localIPs.some(ip => 
+        const vpnLocalIPMatched = localIPs.filter(ip => 
             vpnLocalPatterns.some(pattern => pattern.test(ip)) && 
-            !/^192\.168\./.test(ip) // 192.168 是普通家庭网络，不算
+            !/^192\.168\./.test(ip)
         );
-
-        if (hasVpnLocalIP) {
+        if (vpnLocalIPMatched.length > 0) {
             proxyDetected = true;
+            proxyType = proxyType || 'VPN/虚拟网卡';
+            proxyEvidence.push(`本地IP含VPN特征: ${vpnLocalIPMatched.join(', ')}`);
+        }
+
+        // 检测3: 企业代理IP段 + ISP特征匹配
+        const knownProxyCheck = checkKnownProxyIP(primaryIP.ip, primaryIP.isp);
+        if (knownProxyCheck.isProxy) {
+            proxyDetected = true;
+            proxyType = knownProxyCheck.type;
+            proxyEvidence.push(knownProxyCheck.detail);
+        }
+
+        // 检测4: DNS泄露检测 — 对比Cloudflare trace IP与主IP是否一致
+        const cfResult = dnsLeakResult.dnsServers.find(s => s.source === 'Cloudflare');
+        const ipsbResult = dnsLeakResult.dnsServers.find(s => s.source === 'ip.sb');
+        if (cfResult && cfResult.ip && cfResult.ip !== primaryIP.ip) {
+            proxyDetected = true;
+            proxyType = proxyType || '透明代理';
+            proxyEvidence.push(`DNS泄露: Cloudflare视角IP(${cfResult.ip}) ≠ 主出口IP(${primaryIP.ip})`);
+        }
+        if (ipsbResult && ipsbResult.ip && ipsbResult.ip !== primaryIP.ip && 
+            (!cfResult || ipsbResult.ip !== cfResult.ip)) {
+            proxyDetected = true;
+            proxyType = proxyType || '透明代理';
+            proxyEvidence.push(`多视角IP不一致: ip.sb(${ipsbResult.ip}) ≠ 主IP(${primaryIP.ip})`);
+        }
+
+        // 检测5: 时延异常（国内直连通常 < 200ms，经过代理可能 > 300ms）
+        if (latencyResult.anomaly) {
+            // 单独时延高不确定是代理，作为辅助证据
+            proxyEvidence.push(`时延异常: 平均延迟 ${latencyResult.avgLatency}ms (阈值300ms)`);
+            // 只有配合其他证据时才标记代理
+            if (proxyEvidence.length > 1) {
+                proxyDetected = true;
+                proxyType = proxyType || '可能存在代理';
+            }
         }
 
         // 浏览器和系统信息
@@ -410,15 +591,28 @@ async function detectClientInfo() {
 
         // 代理信息展示
         if (proxyDetected) {
-            $('#proxyInfo').innerHTML = `<span style="color:var(--warning)">⚠️ 检测到代理</span>`;
-            $('#proxyDetails').style.display = 'block';
-            $('#proxyExitIP').textContent = proxyIP || primaryIP.ip;
-            $('#localExitIP').textContent = localIPStr;
+            $('#proxyInfo').innerHTML = `<span style="color:var(--warning)">⚠️ 检测到代理 (${proxyType})</span>`;
         } else {
-            $('#proxyInfo').innerHTML = `<span style="color:var(--success)">未检测到代理</span>`;
-            $('#proxyDetails').style.display = 'block';
-            $('#proxyExitIP').textContent = '无 (直连)';
-            $('#localExitIP').textContent = localIPStr;
+            $('#proxyInfo').innerHTML = `<span style="color:var(--success)">✅ 未检测到代理 (直连)</span>`;
+        }
+
+        // 始终展示详情区域
+        $('#proxyDetails').style.display = 'block';
+        $('#proxyExitIP').textContent = proxyIP || primaryIP.ip;
+        $('#localExitIP').textContent = localIPStr;
+
+        // 展示所有IP视角
+        const allIPViews = [...exitIPs.map(r => `${r.source}: ${r.ip}`)];
+        if (cfResult && cfResult.ip) allIPViews.push(`Cloudflare: ${cfResult.ip}`);
+        if (ipsbResult && ipsbResult.ip) allIPViews.push(`ip.sb: ${ipsbResult.ip}`);
+        $('#multiSourceIPs').textContent = allIPViews.join(' | ');
+
+        // 展示证据
+        if (proxyEvidence.length > 0) {
+            $('#proxyEvidenceList').innerHTML = proxyEvidence.map(e => `<li>${e}</li>`).join('');
+            $('#proxyEvidenceSection').style.display = 'block';
+        } else {
+            $('#proxyEvidenceSection').style.display = 'none';
         }
 
         diagnosisResult.clientInfo = {
@@ -427,9 +621,13 @@ async function detectClientInfo() {
             isp: primaryIP.isp,
             browser, os, networkType,
             proxyDetected,
+            proxyType: proxyType || '',
             proxyIP: proxyIP || '',
+            proxyEvidence,
             localIPs: localIPs,
-            allExitIPs: exitIPs.map(r => r.ip)
+            allExitIPs: exitIPs.map(r => r.ip),
+            dnsLeak: dnsLeakResult,
+            latencyAnomaly: latencyResult
         };
 
         setStatus('clientInfoStatus', 'success');
@@ -897,9 +1095,9 @@ ${subDivider}
   出口 IP:    ${r.clientInfo.ip}
   地理位置:   ${r.clientInfo.location}
   运营商:     ${r.clientInfo.isp}
-  代理状态:   ${r.clientInfo.proxyDetected ? '⚠️ 检测到代理' : '无代理 (直连)'}
+  代理状态:   ${r.clientInfo.proxyDetected ? '⚠️ 检测到代理 (' + (r.clientInfo.proxyType || '未知类型') + ')' : '✅ 无代理 (直连)'}
   代理出口IP: ${r.clientInfo.proxyIP || '无'}
-  本地网络IP: ${r.clientInfo.localIPs && r.clientInfo.localIPs.length > 0 ? r.clientInfo.localIPs.join(', ') : '未获取到'}
+  本地网络IP: ${r.clientInfo.localIPs && r.clientInfo.localIPs.length > 0 ? r.clientInfo.localIPs.join(', ') : '未获取到'}${r.clientInfo.proxyEvidence && r.clientInfo.proxyEvidence.length > 0 ? '\n  检测证据:\n' + r.clientInfo.proxyEvidence.map(e => '    · ' + e).join('\n') : ''}
   浏览器:     ${r.clientInfo.browser}
   操作系统:   ${r.clientInfo.os}
   网络类型:   ${r.clientInfo.networkType}
