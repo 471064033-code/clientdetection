@@ -657,10 +657,10 @@ body {
 /* 代理检测详情样式 */
 .proxy-details {
     margin-top: 12px;
-    padding: 12px 16px;
-    background: var(--bg-secondary, #f6f8fa);
+    padding: 14px 16px;
+    background: rgba(22, 119, 255, 0.06);
     border-radius: 8px;
-    border: 1px dashed var(--border, #d0d7de);
+    border: 1px solid rgba(22, 119, 255, 0.2);
 }
 
 .proxy-detail-grid {
@@ -671,11 +671,21 @@ body {
 
 .proxy-details .info-item label {
     font-size: 12px;
-    color: var(--text-muted, #656d76);
+    color: var(--text-secondary);
 }
 
 .proxy-details .info-item span {
     font-size: 13px;
     font-family: 'SF Mono', 'Cascadia Code', monospace;
+    color: #e6edf3;
     word-break: break-all;
+}
+
+.proxy-details #proxyEvidenceSection label {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.proxy-details #proxyEvidenceList {
+    color: #c9d1d9;
 }
