@@ -32,7 +32,6 @@ const BATCH_DOMAINS = {
         { domain: 'i.gtimg.cn', label: 'i.gtimg.cn' },
         { domain: 'cloud.tencent.com', label: 'cloud.tencent.com' },
         { domain: 'imgcache.qq.com', label: 'imgcache.qq.com' },
-        { domain: 'www.wechat.com', label: 'www.wechat.com' },
         { domain: 'qzone.qq.com', label: 'qzone.qq.com' },
         { domain: 'now.qq.com', label: 'now.qq.com' },
         { domain: 'www.qq.com', label: 'www.qq.com' },
