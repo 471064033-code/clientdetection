@@ -658,9 +658,9 @@ body {
 .proxy-details {
     margin-top: 12px;
     padding: 14px 16px;
-    background: rgba(22, 119, 255, 0.06);
+    background: #1a1f2e;
     border-radius: 8px;
-    border: 1px solid rgba(22, 119, 255, 0.2);
+    border: 1px solid #2d3548;
 }
 
 .proxy-detail-grid {
@@ -671,21 +671,25 @@ body {
 
 .proxy-details .info-item label {
     font-size: 12px;
-    color: var(--text-secondary);
+    color: #8b949e !important;
 }
 
 .proxy-details .info-item span {
     font-size: 13px;
     font-family: 'SF Mono', 'Cascadia Code', monospace;
-    color: #e6edf3;
+    color: #58a6ff !important;
     word-break: break-all;
 }
 
 .proxy-details #proxyEvidenceSection label {
     font-size: 12px;
-    color: var(--text-secondary);
+    color: #8b949e !important;
 }
 
 .proxy-details #proxyEvidenceList {
-    color: #c9d1d9;
+    color: #e6edf3 !important;
+}
+
+.proxy-details #proxyEvidenceList li {
+    color: #e6edf3 !important;
 }
