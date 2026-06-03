@@ -101,18 +101,24 @@ function parseMtrOutput(jsonStr) {
 }
 
 // 执行 mtr 命令
-function executeMTR(target) {
+// 支持 protocol: icmp / tcp / udp，port 仅 tcp/udp 有效
+function executeMTR(target, protocol = 'tcp', port = 80) {
     return new Promise((resolve, reject) => {
         // mtr --json 模式输出 JSON 格式
-        // -c: 发送包数量, -m: 最大跳数, -n: 不做DNS反解(加速), --report: 报告模式
-        const cmd = `mtr --json -c ${PACKET_COUNT} -m ${MAX_HOPS} --report ${target}`;
-        
-        const child = exec(cmd, { timeout: TIMEOUT, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+        let proto = '';
+        if (protocol === 'tcp') proto = `-T -P ${port}`;
+        else if (protocol === 'udp') proto = `-u -P ${port}`;
+
+        const cmd = `mtr --json -c ${PACKET_COUNT} -m ${MAX_HOPS} -n ${proto} ${target}`;
+
+        exec(cmd, { timeout: TIMEOUT, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
             if (error) {
                 // mtr 可能返回非 0 退出码但仍有有效输出
                 if (stdout && stdout.trim().startsWith('{')) {
                     try {
                         const result = parseMtrOutput(stdout);
+                        result.protocol = protocol;
+                        result.port = protocol === 'tcp' || protocol === 'udp' ? port : null;
                         resolve(result);
                         return;
                     } catch (e) {
@@ -122,7 +128,7 @@ function executeMTR(target) {
                 reject(new Error(`MTR execution failed: ${error.message}`));
                 return;
             }
-            
+
             if (!stdout || !stdout.trim()) {
                 reject(new Error('MTR returned empty output'));
                 return;
@@ -130,12 +136,88 @@ function executeMTR(target) {
 
             try {
                 const result = parseMtrOutput(stdout);
+                result.protocol = protocol;
+                result.port = protocol === 'tcp' || protocol === 'udp' ? port : null;
                 resolve(result);
             } catch (e) {
                 reject(e);
             }
         });
     });
+}
+
+// 自动协议策略：先 TCP，若仅 1 跳则补探测 ICMP，若 ICMP 末跳不可见再补 UDP
+function isResultVisibilityPoor(result) {
+    if (!result || !Array.isArray(result.hops) || result.hops.length === 0) return true;
+    const lastHop = result.hops[result.hops.length - 1] || {};
+    const lastHost = String(lastHop.ip || lastHop.hostname || '').trim();
+    const lastLoss = parseFloat(String(lastHop.loss || '0').replace('%', ''));
+    const isUnknownHost = !lastHost || lastHost === '???';
+    const isFullLoss = Number.isFinite(lastLoss) && lastLoss >= 100;
+    return isUnknownHost || isFullLoss;
+}
+
+function attachAutoMeta(result, selectedProtocol, attempts) {
+    result.protocol = 'auto';
+    result.autoSelectedProtocol = selectedProtocol;
+    result.autoAttempts = attempts;
+    return result;
+}
+
+async function executeMTRAuto(target, port = 80) {
+    const attempts = [];
+    let tcpResult = null;
+
+    try {
+        tcpResult = await executeMTR(target, 'tcp', port);
+        attempts.push({ protocol: 'tcp', port, hops: tcpResult.hops.length, ok: true });
+        if (tcpResult.hops.length > 1) {
+            return attachAutoMeta(tcpResult, 'tcp', attempts);
+        }
+    } catch (error) {
+        attempts.push({ protocol: 'tcp', port, ok: false, error: error.message });
+    }
+
+    let icmpResult = null;
+    try {
+        icmpResult = await executeMTR(target, 'icmp', port);
+        attempts.push({ protocol: 'icmp', hops: icmpResult.hops.length, ok: true });
+        if (!isResultVisibilityPoor(icmpResult)) {
+            return attachAutoMeta(icmpResult, 'icmp', attempts);
+        }
+    } catch (error) {
+        attempts.push({ protocol: 'icmp', ok: false, error: error.message });
+    }
+
+    try {
+        const udpResult = await executeMTR(target, 'udp', port);
+        attempts.push({ protocol: 'udp', port, hops: udpResult.hops.length, ok: true });
+        if (!isResultVisibilityPoor(udpResult)) {
+            return attachAutoMeta(udpResult, 'udp', attempts);
+        }
+
+        // udp 也不可见时，优先回退到 tcp 结果（通常不会给出误导性的 100% 丢包末跳）
+        if (tcpResult) {
+            attempts.push({ protocol: 'fallback', selected: 'tcp', reason: 'icmp/udp visibility poor' });
+            return attachAutoMeta(tcpResult, 'tcp', attempts);
+        }
+
+        return attachAutoMeta(udpResult, 'udp', attempts);
+    } catch (error) {
+        attempts.push({ protocol: 'udp', port, ok: false, error: error.message });
+    }
+
+    if (icmpResult) {
+        attempts.push({ protocol: 'fallback', selected: 'icmp', reason: 'udp failed' });
+        return attachAutoMeta(icmpResult, 'icmp', attempts);
+    }
+
+    if (tcpResult) {
+        attempts.push({ protocol: 'fallback', selected: 'tcp', reason: 'icmp/udp failed' });
+        return attachAutoMeta(tcpResult, 'tcp', attempts);
+    }
+
+    throw new Error('All protocol attempts failed in auto mode');
 }
 
 // ==================== HTTP 服务 ====================
@@ -187,8 +269,22 @@ const server = http.createServer(async (req, res) => {
         }
 
         try {
-            console.log(`[${new Date().toISOString()}] MTR request: ${target} from ${clientIP}`);
-            const result = await executeMTR(target);
+            const proto = (parsedUrl.query.protocol || 'auto').toLowerCase();
+            const allowedProtocols = new Set(['auto', 'tcp', 'icmp', 'udp']);
+            if (!allowedProtocols.has(proto)) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Invalid protocol. Must be one of: auto, tcp, icmp, udp', code: 400 }));
+                return;
+            }
+
+            const port = parseInt(parsedUrl.query.port || '80', 10);
+            const validPort = Number.isInteger(port) && port > 0 && port <= 65535 ? port : 80;
+            console.log(`[${new Date().toISOString()}] MTR request: ${target} (${proto}:${validPort}) from ${clientIP}`);
+
+            const result = proto === 'auto'
+                ? await executeMTRAuto(target, validPort)
+                : await executeMTR(target, proto, validPort);
+
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(result));
         } catch (error) {

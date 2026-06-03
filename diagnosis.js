@@ -5,11 +5,7 @@
 
 // ==================== 配置 ====================
 const CONFIG = {
-    // 获取客户端IP的公共API（可替换为自有服务）
-    ipApis: [
-        'https://ipinfo.io/json',
-        'https://ip-api.com/json/?lang=zh-CN&fields=status,message,country,regionName,city,isp,org,as,query'
-    ],
+    // 获取客户端IP的公共API源已在 getExitIPs() 中定义（6个源并发，增强可用性）
     // DNS over HTTPS 接口
     dohServers: [
         'https://dns.alidns.com/resolve',
@@ -20,8 +16,9 @@ const CONFIG = {
         { size: '1MB', url: '' },  // 由诊断时动态生成
         { size: '5MB', url: '' }
     ],
-    // MTR 后端 API（需自行部署）
-    mtrApiBase: '',
+    // MTR 后端 API（已部署，TencentOS 3.2 + mtr-tiny + Node 10 + systemd）
+    // 默认走 TCP 80 模式（云内 ICMP 通常被 ACL 限制）
+    mtrApiBase: 'http://30.184.62.61.devcloud.woa.com:3089',
     // 超时时间
     timeout: 15000
 };
@@ -430,38 +427,117 @@ async function detectLatencyAnomaly() {
 async function getExitIPs() {
     const results = [];
 
-    // 源1: ip-api.com
-    try {
-        const resp = await fetchWithTimeout(CONFIG.ipApis[1], {}, 8000);
-        const data = await resp.json();
-        if (data.status === 'success') {
-            results.push({
-                source: 'ip-api.com',
-                ip: data.query,
-                location: `${data.country} ${data.regionName} ${data.city}`,
-                isp: data.isp || data.org,
-                as: data.as
-            });
+    // 定义多个IP源，增加成功概率
+    const ipSources = [
+        // 源1: ip-api.com（注意：免费版仅支持 HTTP，HTTPS页面可能被CORS阻止）
+        {
+            url: 'http://ip-api.com/json/?lang=zh-CN&fields=status,message,country,regionName,city,isp,org,as,query',
+            parse: async (resp) => {
+                const data = await resp.json();
+                if (data.status === 'success') {
+                    return {
+                        source: 'ip-api.com',
+                        ip: data.query,
+                        location: `${data.country} ${data.regionName} ${data.city}`,
+                        isp: data.isp || data.org,
+                        as: data.as
+                    };
+                }
+                return null;
+            }
+        },
+        // 源2: ipinfo.io
+        {
+            url: 'https://ipinfo.io/json',
+            parse: async (resp) => {
+                const data = await resp.json();
+                if (data.ip) {
+                    return {
+                        source: 'ipinfo.io',
+                        ip: data.ip,
+                        location: `${data.country || ''} ${data.region || ''} ${data.city || ''}`.trim(),
+                        isp: data.org || '',
+                        as: ''
+                    };
+                }
+                return null;
+            }
+        },
+        // 源3: ip.sb（支持HTTPS，CORS友好）
+        {
+            url: 'https://api.ip.sb/jsonip',
+            parse: async (resp) => {
+                const data = await resp.json();
+                if (data.ip) {
+                    return { source: 'ip.sb', ip: data.ip, location: '', isp: '', as: '' };
+                }
+                return null;
+            }
+        },
+        // 源4: Cloudflare trace（返回纯文本，稳定可靠）
+        {
+            url: 'https://1.1.1.1/cdn-cgi/trace',
+            parse: async (resp) => {
+                const text = await resp.text();
+                const cfData = {};
+                text.split('\n').forEach(line => {
+                    const [key, value] = line.split('=');
+                    if (key && value) cfData[key.trim()] = value.trim();
+                });
+                if (cfData.ip) {
+                    return {
+                        source: 'Cloudflare',
+                        ip: cfData.ip,
+                        location: `${cfData.loc || ''}`,
+                        isp: '',
+                        as: ''
+                    };
+                }
+                return null;
+            }
+        },
+        // 源5: ipify（简单可靠，支持CORS）
+        {
+            url: 'https://api.ipify.org?format=json',
+            parse: async (resp) => {
+                const data = await resp.json();
+                if (data.ip) {
+                    return { source: 'ipify', ip: data.ip, location: '', isp: '', as: '' };
+                }
+                return null;
+            }
+        },
+        // 源6: seeip.org（CORS友好）
+        {
+            url: 'https://ip.seeip.org/jsonip',
+            parse: async (resp) => {
+                const data = await resp.json();
+                if (data.ip) {
+                    return { source: 'seeip.org', ip: data.ip, location: '', isp: '', as: '' };
+                }
+                return null;
+            }
         }
-    } catch (e) {
-        console.warn('ip-api.com failed');
-    }
+    ];
 
-    // 源2: ipinfo.io
-    try {
-        const resp = await fetchWithTimeout(CONFIG.ipApis[0], {}, 8000);
-        const data = await resp.json();
-        if (data.ip) {
-            results.push({
-                source: 'ipinfo.io',
-                ip: data.ip,
-                location: `${data.country || ''} ${data.region || ''} ${data.city || ''}`.trim(),
-                isp: data.org || '',
-                as: ''
-            });
+    // 并发请求所有源，取成功的
+    const settled = await Promise.allSettled(
+        ipSources.map(async (src) => {
+            try {
+                const resp = await fetchWithTimeout(src.url, {}, 8000);
+                if (!resp.ok) return null;
+                return await src.parse(resp);
+            } catch (e) {
+                console.warn(`IP source ${src.source || src.url} failed:`, e.message);
+                return null;
+            }
+        })
+    );
+
+    for (const result of settled) {
+        if (result.status === 'fulfilled' && result.value) {
+            results.push(result.value);
         }
-    } catch (e) {
-        console.warn('ipinfo.io failed');
     }
 
     return results;
@@ -482,12 +558,16 @@ async function detectClientInfo() {
         // 如果所有源都获取失败
         if (exitIPs.length === 0) {
             $('#clientIP').textContent = '获取失败';
+            $('#clientIP').style.color = 'var(--error)';
             $('#clientLocation').textContent = '--';
             $('#clientISP').textContent = '--';
             $('#clientBrowser').textContent = detectBrowser(navigator.userAgent);
             $('#clientOS').textContent = detectOS(navigator.userAgent);
             $('#clientNetwork').textContent = getNetworkType();
-            $('#proxyInfo').textContent = '--';
+            $('#proxyInfo').textContent = '无法检测（未获取到公网IP）';
+            $('#primaryIPv4').textContent = '--';
+            $('#primaryIPv6').textContent = '--';
+            $('#ipConsistencyNote').textContent = '未获取到可用公网 IP';
 
             diagnosisResult.clientInfo = {
                 ip: '获取失败',
@@ -500,27 +580,55 @@ async function detectClientInfo() {
                 localIPs: localIPs
             };
 
-            setStatus('clientInfoStatus', 'error', '失败');
-            showToast('⚠️ 无法获取公网IP，请检查网络连接后重试');
-            return false;
+            setStatus('clientInfoStatus', 'error', 'IP获取失败');
+            showToast('⚠️ 无法获取公网IP，但其他诊断项仍可继续');
+            // 不再 return false，允许后续诊断继续
+            return true;
         }
 
         // 主IP数据（以第一个成功的为准）
         const primaryIP = exitIPs[0];
+
+        // 工具：判断 IP 是否是 IPv6（含 ":"）
+        const isIPv6 = (ip) => typeof ip === 'string' && ip.indexOf(':') > -1;
+        // 工具：判断两个 IP 是否"实质相同"——只对比同协议族
+        // IPv4 和 IPv6 之间不可比较（同一终端双栈下本就有两个地址，不算代理）
+        const ipsEquivalent = (a, b) => {
+            if (!a || !b) return true; // 缺数据时不判异常
+            if (isIPv6(a) !== isIPv6(b)) return true; // 跨协议族 → 视为一致
+            return a === b;
+        };
 
         // === 多维度代理检测 ===
         let proxyDetected = false;
         let proxyType = '';
         let proxyIP = '';
         const proxyEvidence = []; // 收集所有代理证据
+        // 仅在同协议族内比较：分别看 IPv4 集合 / IPv6 集合 是否各自一致
+        const ipv4Set = [...new Set(exitIPs.map(r => r.ip).filter(ip => !isIPv6(ip)))];
+        const ipv6Set = [...new Set(exitIPs.map(r => r.ip).filter(ip => isIPv6(ip)))];
         const uniqueIPs = [...new Set(exitIPs.map(r => r.ip))];
 
-        // 检测1: 多源IP不一致 → 分流代理
-        if (uniqueIPs.length > 1) {
+        const primaryIPv4 = ipv4Set[0] || '--';
+        const primaryIPv6 = ipv6Set[0] || '--';
+        let ipConsistencyNote = '多源 IP 一致';
+        if (ipv4Set.length > 1 || ipv6Set.length > 1) {
+            const family = ipv4Set.length > 1 ? 'IPv4' : 'IPv6';
+            ipConsistencyNote = `${family} 多源结果不一致（可能由分流/运营商CGNAT导致）`;
+        } else if (ipv4Set.length === 1 && ipv6Set.length === 1) {
+            ipConsistencyNote = '双栈网络：不同网站可能分别显示 IPv4 或 IPv6（正常）';
+        }
+
+        // 检测1: 同协议族内多源IP不一致 → 分流代理
+        if (ipv4Set.length > 1 || ipv6Set.length > 1) {
             proxyDetected = true;
             proxyType = '分流代理';
-            proxyIP = uniqueIPs.join(' / ');
+            const conflict = ipv4Set.length > 1 ? ipv4Set : ipv6Set;
+            proxyIP = conflict.join(' / ');
             proxyEvidence.push(`多源出口IP不一致: ${proxyIP}`);
+        } else if (ipv4Set.length === 1 && ipv6Set.length === 1) {
+            // 双栈场景，正常，不算证据
+            proxyEvidence.push(`IPv4/IPv6 双栈：${ipv4Set[0]} + ${ipv6Set[0]}（正常，非代理）`);
         }
 
         // 检测2: WebRTC本地IP为VPN网段
@@ -548,16 +656,16 @@ async function detectClientInfo() {
             proxyEvidence.push(knownProxyCheck.detail);
         }
 
-        // 检测4: DNS泄露检测 — 对比Cloudflare trace IP与主IP是否一致
+        // 检测4: DNS泄露检测 — 对比Cloudflare trace IP与主IP是否一致（仅同协议族比较）
         const cfResult = dnsLeakResult.dnsServers.find(s => s.source === 'Cloudflare');
         const ipsbResult = dnsLeakResult.dnsServers.find(s => s.source === 'ip.sb');
-        if (cfResult && cfResult.ip && cfResult.ip !== primaryIP.ip) {
+        if (cfResult && cfResult.ip && !ipsEquivalent(cfResult.ip, primaryIP.ip)) {
             proxyDetected = true;
             proxyType = proxyType || '透明代理';
             proxyEvidence.push(`DNS泄露: Cloudflare视角IP(${cfResult.ip}) ≠ 主出口IP(${primaryIP.ip})`);
         }
-        if (ipsbResult && ipsbResult.ip && ipsbResult.ip !== primaryIP.ip && 
-            (!cfResult || ipsbResult.ip !== cfResult.ip)) {
+        if (ipsbResult && ipsbResult.ip && !ipsEquivalent(ipsbResult.ip, primaryIP.ip) &&
+            (!cfResult || !ipsEquivalent(ipsbResult.ip, cfResult.ip))) {
             proxyDetected = true;
             proxyType = proxyType || '透明代理';
             proxyEvidence.push(`多视角IP不一致: ip.sb(${ipsbResult.ip}) ≠ 主IP(${primaryIP.ip})`);
@@ -599,6 +707,9 @@ async function detectClientInfo() {
         $('#proxyDetails').style.display = 'block';
         $('#proxyExitIP').textContent = proxyIP || primaryIP.ip;
         $('#localExitIP').textContent = localIPStr;
+        $('#primaryIPv4').textContent = primaryIPv4;
+        $('#primaryIPv6').textContent = primaryIPv6;
+        $('#ipConsistencyNote').textContent = ipConsistencyNote;
 
         // 展示所有IP视角
         const allIPViews = [...exitIPs.map(r => `${r.source}: ${r.ip}`)];
@@ -606,9 +717,15 @@ async function detectClientInfo() {
         if (ipsbResult && ipsbResult.ip) allIPViews.push(`ip.sb: ${ipsbResult.ip}`);
         $('#multiSourceIPs').textContent = allIPViews.join(' | ');
 
-        // 展示证据
-        if (proxyEvidence.length > 0) {
-            $('#proxyEvidenceList').innerHTML = proxyEvidence.map(e => `<li>${e}</li>`).join('');
+        // 展示证据：区分"实质证据"和"信息说明"
+        const realEvidence = proxyEvidence.filter(e => !e.includes('双栈：'));
+        const stackInfo = proxyEvidence.filter(e => e.includes('双栈：'));
+        const evidenceHtml = [
+            ...realEvidence.map(e => `<li>${e}</li>`),
+            ...stackInfo.map(e => `<li style="color:#8b949e; list-style:none; margin-left:-20px;">ⓘ ${e}</li>`)
+        ].join('');
+        if (evidenceHtml) {
+            $('#proxyEvidenceList').innerHTML = evidenceHtml;
             $('#proxyEvidenceSection').style.display = 'block';
         } else {
             $('#proxyEvidenceSection').style.display = 'none';
@@ -625,6 +742,9 @@ async function detectClientInfo() {
             proxyEvidence,
             localIPs: localIPs,
             allExitIPs: exitIPs.map(r => r.ip),
+            primaryIPv4,
+            primaryIPv6,
+            ipConsistencyNote,
             dnsLeak: dnsLeakResult,
             latencyAnomaly: latencyResult
         };
@@ -846,7 +966,9 @@ async function detectConnectivity(domain) {
                 if (headers['x-cdn-provider']) cdnNode = headers['x-cdn-provider'];
 
             } catch (e) {
-                httpStatus = '可达(CORS受限)';
+                // CORS 受限：no-cors 请求成功（说明能连上目标），但浏览器同源策略禁止 JS 读取真实状态码和响应头
+                // 这不是网络问题，是浏览器安全机制——能正常访问，只是看不到详细信息
+                httpStatus = '可连通';
             }
 
         } catch (error) {
@@ -864,8 +986,17 @@ async function detectConnectivity(domain) {
 
         // 更新UI
         $('#httpStatus').textContent = httpStatus;
-        $('#httpStatus').style.color = (httpStatus >= 200 && httpStatus < 400) ? 'var(--success)' : 
-                                      httpStatus >= 400 ? 'var(--error)' : 'var(--text-primary)';
+        // 数字状态码用红绿标色；"可连通" 视为成功（绿色）
+        if (typeof httpStatus === 'number') {
+            $('#httpStatus').style.color = (httpStatus >= 200 && httpStatus < 400) ? 'var(--success)' :
+                                          httpStatus >= 400 ? 'var(--error)' : 'var(--text-primary)';
+        } else if (httpStatus.indexOf('可连通') === 0) {
+            $('#httpStatus').style.color = 'var(--success)';
+        } else if (httpStatus === '超时' || httpStatus === '不可达') {
+            $('#httpStatus').style.color = 'var(--error)';
+        } else {
+            $('#httpStatus').style.color = 'var(--text-primary)';
+        }
         $('#responseTime').textContent = responseTime;
         $('#sslInfo').textContent = sslInfo;
         $('#cdnNode').textContent = cdnNode;
@@ -902,14 +1033,17 @@ async function detectMTR(targetIP, domain) {
         if (CONFIG.mtrApiBase) {
             try {
                 const resp = await fetchWithTimeout(
-                    `${CONFIG.mtrApiBase}/mtr?target=${encodeURIComponent(target)}`,
-                    {}, 60000 // MTR 需要较长超时（mtr -c 10 可能需要 30-50s）
+                    `${CONFIG.mtrApiBase}/mtr?target=${encodeURIComponent(target)}&protocol=auto&port=80`,
+                    {}, 60000
                 );
                 if (resp.ok) {
                     mtrData = await resp.json();
                     if (mtrData.error) {
                         console.warn('MTR API returned error:', mtrData.error);
                         mtrData = null;
+                    } else {
+                        mtrData.mode = 'server';
+                        mtrData.source = 'mtr-api';
                     }
                 }
             } catch (e) {
@@ -917,45 +1051,16 @@ async function detectMTR(targetIP, domain) {
             }
         }
 
-        // 如果没有后端 API 或调用失败，使用浏览器端真实探测（有限能力）
+        // 没有后端 API 时，仍跑浏览器端有限探测作为占位（标注清楚）
         if (!mtrData) {
             mtrData = await browserTraceroute(target);
         }
 
-        // 更新UI
-        $('#mtrTarget').textContent = target;
-        $('#mtrHops').textContent = mtrData.hops.length;
-        $('#mtrLoss').textContent = mtrData.summary.avgLoss;
-        $('#mtrAvgLatency').textContent = mtrData.summary.avgLatency;
-
-        const tbody = $('#mtrTableBody');
-        tbody.innerHTML = '';
-
-        // 如果是浏览器端探测，显示提示标记
-        if (mtrData.mode === 'browser') {
-            const infoTr = document.createElement('tr');
-            infoTr.innerHTML = `<td colspan="8" style="text-align:center; color:#f0883e; font-size:12px; padding:8px;">
-                ⚠️ 浏览器端探测（仅最终跳可达性 + 延迟，中间路由需部署 MTR API 服务获取）
-            </td>`;
-            tbody.appendChild(infoTr);
-        }
-
-        mtrData.hops.forEach(hop => {
-            const tr = document.createElement('tr');
-            const lossClass = parseFloat(hop.loss) === 0 ? 'loss-ok' : 
-                             parseFloat(hop.loss) < 10 ? 'loss-warn' : 'loss-error';
-            tr.innerHTML = `
-                <td>${hop.hop}</td>
-                <td>${hop.ip}</td>
-                <td>${hop.hostname}</td>
-                <td class="${lossClass}">${hop.loss}</td>
-                <td>${hop.sent}</td>
-                <td>${hop.best}</td>
-                <td>${hop.avg}</td>
-                <td>${hop.worst}</td>
-            `;
-            tbody.appendChild(tr);
-        });
+        // 存储到服务端视角
+        mtrState.server = mtrData;
+        // 默认展示服务端视角
+        renderMtrByMode('server');
+        analyzeMtrComparison();
 
         diagnosisResult.mtr = mtrData;
         setStatus('mtrStatus', 'success');
@@ -1100,6 +1205,397 @@ async function browserTraceroute(target) {
         note: '浏览器安全限制，仅能探测最终跳。完整路由路径需部署 MTR API 后端服务。'
     };
 }
+
+// ==================== 双拨测：状态存储 + 视角切换 ====================
+const mtrState = {
+    server: null,   // 服务端 mtr-api 拨测结果
+    client: null,   // 客户端粘贴解析结果
+    currentMode: 'server'  // 当前展示的视角：server / client / compare
+};
+
+// 渲染指定视角到上方表格
+function renderMtrByMode(mode) {
+    mtrState.currentMode = mode;
+    const data = mode === 'server' ? mtrState.server : mtrState.client;
+    const label = mode === 'server' ? '服务端视角' : '客户端视角';
+
+    $('#mtrTableLabel').textContent = label;
+    $('#mtrCurrentMode').textContent = mode === 'server' ? '服务端' : '客户端';
+
+    const tbody = $('#mtrTableBody');
+    tbody.innerHTML = '';
+
+    if (!data) {
+        $('#mtrTarget').textContent = '--';
+        $('#mtrHops').textContent = '--';
+        $('#mtrLoss').textContent = '--';
+        $('#mtrAvgLatency').textContent = '--';
+        const emptyTr = document.createElement('tr');
+        emptyTr.innerHTML = `<td colspan="8" style="text-align:center; color:#8b949e; padding:14px;">暂无${label}数据，请先发起拨测</td>`;
+        tbody.appendChild(emptyTr);
+        return;
+    }
+
+    $('#mtrTarget').textContent = data.target;
+    $('#mtrHops').textContent = data.hops.length;
+    $('#mtrLoss').textContent = data.summary.avgLoss;
+    $('#mtrAvgLatency').textContent = data.summary.avgLatency;
+
+    const sourceColor = mode === 'server' ? '#58a6ff' : '#7ee787';
+    let sourceLabel = mode === 'server'
+        ? `🌐 服务端拨测 · 来源 ${data.source || 'mtr-api'}`
+        : `💻 客户端真实路径 · 来源 ${data.format || 'mtr/tracert'}`;
+
+    if (mode === 'server' && data.protocol === 'auto') {
+        const attempts = Array.isArray(data.autoAttempts)
+            ? data.autoAttempts
+                .filter(a => a && a.protocol)
+                .map(a => a.ok ? `${a.protocol}${a.hops ? `(${a.hops}跳)` : ''}` : `${a.protocol}(失败)`)
+                .join(' → ')
+            : '';
+        sourceLabel += ` · 自动补探测：${attempts || (data.autoSelectedProtocol || 'auto')}`;
+    }
+
+    const banner = document.createElement('tr');
+    banner.innerHTML = `<td colspan="8" style="text-align:center; color:${sourceColor}; font-size:12px; padding:8px; background:rgba(255,255,255,0.02);">
+        ${sourceLabel} · ${data.hops.length} 跳完整路径
+    </td>`;
+    tbody.appendChild(banner);
+
+    data.hops.forEach(hop => {
+        const tr = document.createElement('tr');
+        const lossNum = parseFloat(hop.loss);
+        const lossClass = isNaN(lossNum) ? '' : lossNum === 0 ? 'loss-ok' : lossNum < 10 ? 'loss-warn' : 'loss-error';
+        tr.innerHTML = `
+            <td>${hop.hop}</td>
+            <td>${hop.ip}</td>
+            <td>${hop.hostname}</td>
+            <td class="${lossClass}">${hop.loss}</td>
+            <td>${hop.sent}</td>
+            <td>${hop.best}</td>
+            <td>${hop.avg}</td>
+            <td>${hop.worst}</td>
+        `;
+        tbody.appendChild(tr);
+    });
+
+    diagnosisResult.mtr = data;
+}
+
+// 自动判断：基于双视角丢包/延迟得出结论
+function analyzeMtrComparison() {
+    const s = mtrState.server, c = mtrState.client;
+    const empty = $('#mtrCompareEmpty'), result = $('#mtrCompareResult');
+
+    if (!s && !c) {
+        empty.style.display = 'block';
+        empty.textContent = '完成两个视角的拨测后，这里会自动给出判断结论';
+        result.style.display = 'none';
+        return;
+    }
+    if (!s || !c) {
+        empty.style.display = 'block';
+        empty.textContent = `还需要完成 ${!s ? '服务端' : '客户端'} 视角的拨测才能对比`;
+        result.style.display = 'none';
+        return;
+    }
+
+    empty.style.display = 'none';
+    result.style.display = 'block';
+
+    $('#cmpServerLoss').textContent = s.summary.avgLoss;
+    $('#cmpServerLatency').textContent = s.summary.avgLatency;
+    $('#cmpServerHops').textContent = s.hops.length;
+    $('#cmpClientLoss').textContent = c.summary.avgLoss;
+    $('#cmpClientLatency').textContent = c.summary.avgLatency;
+    $('#cmpClientHops').textContent = c.hops.length;
+
+    const sLoss = parseFloat(s.summary.avgLoss);
+    const cLoss = parseFloat(c.summary.avgLoss);
+    const sLat = parseFloat(s.summary.avgLatency);
+    const cLat = parseFloat(c.summary.avgLatency);
+    const LOSS_THRESHOLD = 5;     // >5% 视为异常
+    const LAT_THRESHOLD = 300;    // >300ms 视为异常（跨国除外）
+
+    const sBad = sLoss > LOSS_THRESHOLD || sLat > LAT_THRESHOLD;
+    const cBad = cLoss > LOSS_THRESHOLD || cLat > LAT_THRESHOLD;
+
+    const verdict = $('#mtrVerdictText');
+    let html = '';
+
+    if (!sBad && !cBad) {
+        html = `<span style="color:#7ee787;">✅ 两条路径均正常</span>。当前网络层无明显丢包和高延迟。<br>
+        <span style="color:#8b949e;">建议下一步：</span>检查 HTTP 状态码、TLS 握手、CDN 配置、应用日志。问题大概率不在网络。`;
+    } else if (!sBad && cBad) {
+        const badHop = findWorstHop(c.hops);
+        html = `<span style="color:#f0883e;">⚠️ 客户端视角异常，服务端正常</span>。问题集中在<strong style="color:#e6edf3;">用户客户端到目标</strong>的链路。<br>
+        ${badHop ? `异常最严重的跳：第 <strong style="color:#f0883e;">${badHop.hop}</strong> 跳（${badHop.ip}），丢包 ${badHop.loss}，延迟 ${badHop.avg}。<br>` : ''}
+        <span style="color:#8b949e;">建议下一步：</span>排查客户端本地网关 / 运营商出口 / 跨国线路。如客户端首跳就异常，重点检查 WiFi/路由器/iOA 代理。`;
+    } else if (sBad && !cBad) {
+        const badHop = findWorstHop(s.hops);
+        html = `<span style="color:#f0883e;">⚠️ 服务端视角异常，客户端正常</span>。问题在<strong style="color:#e6edf3;">服务器到目标</strong>的链路，与终端用户无关。<br>
+        ${badHop ? `异常最严重的跳：第 <strong style="color:#f0883e;">${badHop.hop}</strong> 跳（${badHop.ip}），丢包 ${badHop.loss}。<br>` : ''}
+        <span style="color:#8b949e;">建议下一步：</span>不影响真实用户，可换服务器机房 / 检查骨干运营商 / 联系 IDC。`;
+    } else {
+        // 两条都异常 → 找共同异常跳
+        const commonBad = findCommonBadHops(s.hops, c.hops);
+        html = `<span style="color:#f85149;">🔴 两条路径均异常</span>。问题在<strong style="color:#e6edf3;">目标侧或两条路径共有的中间链路</strong>。<br>
+        ${commonBad.length > 0 ? `共同异常跳：<strong style="color:#f85149;">${commonBad.join(', ')}</strong>，通常是目标 CDN 节点或骨干运营商问题。<br>` : ''}
+        <span style="color:#8b949e;">建议下一步：</span>联系目标侧（CDN/源站）确认健康状态。EdgeOne 场景下检查节点状态页和健康监控。`;
+    }
+
+    // 抖动检测
+    const sJitter = jitterScore(s.hops);
+    const cJitter = jitterScore(c.hops);
+    if (sJitter > 0.3 || cJitter > 0.3) {
+        html += `<br><br><span style="color:#f0883e;">📈 抖动警告：</span>${sJitter > 0.3 ? '服务端' : ''}${sJitter > 0.3 && cJitter > 0.3 ? '、' : ''}${cJitter > 0.3 ? '客户端' : ''} 链路抖动较大（max-min &gt; 3×avg），疑似拥塞或链路不稳定。`;
+    }
+
+    verdict.innerHTML = html;
+}
+
+function findWorstHop(hops) {
+    if (!hops || hops.length === 0) return null;
+    return hops
+        .filter(h => !isNaN(parseFloat(h.loss)) && parseFloat(h.loss) > 0)
+        .sort((a, b) => parseFloat(b.loss) - parseFloat(a.loss))[0] || null;
+}
+
+function findCommonBadHops(serverHops, clientHops) {
+    const sBadIPs = new Set(serverHops.filter(h => parseFloat(h.loss) > 5).map(h => h.ip));
+    const common = [];
+    clientHops.forEach(h => {
+        if (parseFloat(h.loss) > 5 && sBadIPs.has(h.ip)) common.push(h.ip);
+    });
+    return common;
+}
+
+function jitterScore(hops) {
+    if (!hops || hops.length === 0) return 0;
+    let abnormal = 0;
+    hops.forEach(h => {
+        const best = parseFloat(h.best);
+        const worst = parseFloat(h.worst);
+        const avg = parseFloat(h.avg);
+        if (!isNaN(best) && !isNaN(worst) && !isNaN(avg) && avg > 0) {
+            if ((worst - best) > 3 * avg) abnormal++;
+        }
+    });
+    return abnormal / hops.length;
+}
+
+// ==================== 真实 MTR 解析（粘贴模式） ====================
+// 支持解析：
+//   1) Linux/Mac 的 mtr -r / mtr --report 输出
+//   2) Windows tracert 输出
+//   3) Mac/Linux traceroute 输出
+function parsePastedMTR(text) {
+    if (!text || !text.trim()) return null;
+
+    const lines = text.split('\n').map(l => l.replace(/\r/g, ''));
+    const hops = [];
+    let target = '';
+    let format = 'unknown';
+
+    // 检测格式 + 提取目标
+    for (const line of lines) {
+        // mtr 格式: "HOST: hostname  Loss%  Snt  Last  Avg  Best  Wrst  StDev"
+        if (/^\s*HOST:\s+\S+/i.test(line) || /Loss%\s+Snt\s+Last/i.test(line)) {
+            format = 'mtr';
+        }
+        // mtr 报告头: "Start: ... HOST: localhost"  目标在最后一行
+        // tracert 格式: "Tracing route to xxx [a.b.c.d]"
+        const tracertMatch = line.match(/[Tt]racing route to\s+(\S+)\s*\[([\d.]+)\]/);
+        if (tracertMatch) {
+            format = 'tracert';
+            target = tracertMatch[2] || tracertMatch[1];
+        }
+        // traceroute 格式: "traceroute to xxx (a.b.c.d), 30 hops max"
+        const traceMatch = line.match(/traceroute to\s+(\S+)\s*\(([\d.]+)\)/);
+        if (traceMatch) {
+            format = 'traceroute';
+            target = traceMatch[2];
+        }
+    }
+
+    // 解析 mtr --report 格式
+    // 例: "  1.|-- 192.168.1.1                0.0%    10    0.5   0.6   0.4   0.8   0.1"
+    if (format === 'mtr' || /\d+\.\|--/.test(text)) {
+        format = 'mtr';
+        const mtrLineRe = /^\s*(\d+)\.\|--\s+(\S+)\s+([\d.]+)%\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/;
+        for (const line of lines) {
+            const m = line.match(mtrLineRe);
+            if (m) {
+                hops.push({
+                    hop: parseInt(m[1]),
+                    ip: m[2],
+                    hostname: m[2],
+                    loss: `${m[3]}%`,
+                    sent: m[4],
+                    best: `${m[6]} ms`,
+                    avg: `${m[7]} ms`,
+                    worst: `${m[8]} ms`
+                });
+            }
+        }
+    }
+    // 解析 Windows tracert 格式
+    // 例: "  1     1 ms     1 ms     1 ms  192.168.1.1"
+    // 例: "  5     *        *        *     请求超时"
+    else if (format === 'tracert') {
+        const tracertLineRe = /^\s*(\d+)\s+(.+?)\s+(\S+)\s*$/;
+        for (const line of lines) {
+            // 跳过表头和空行
+            if (!/^\s*\d+\s/.test(line)) continue;
+            const m = line.match(/^\s*(\d+)\s+(.+)$/);
+            if (!m) continue;
+            const hop = parseInt(m[1]);
+            const rest = m[2];
+            // 三个 RTT + IP/主机名
+            // 格式: "1 ms  1 ms  1 ms  192.168.1.1"  或 "* * * 请求超时"
+            const ipMatch = rest.match(/(\d+\.\d+\.\d+\.\d+)/);
+            const rttMatches = [...rest.matchAll(/(\*|<?\s*\d+)\s*ms/g)];
+            const stars = (rest.match(/\*/g) || []).length;
+            const ip = ipMatch ? ipMatch[1] : '*';
+
+            const rtts = rttMatches.map(r => {
+                const v = r[1].trim();
+                if (v === '*') return null;
+                return parseFloat(v.replace('<', ''));
+            }).filter(v => v !== null);
+
+            const sent = 3;
+            const lossRate = stars >= 3 ? '100.0%' : `${((stars / 3) * 100).toFixed(1)}%`;
+
+            if (rtts.length > 0) {
+                hops.push({
+                    hop,
+                    ip,
+                    hostname: ip,
+                    loss: lossRate,
+                    sent: String(sent),
+                    best: `${Math.min(...rtts).toFixed(1)} ms`,
+                    avg: `${(rtts.reduce((a, b) => a + b, 0) / rtts.length).toFixed(1)} ms`,
+                    worst: `${Math.max(...rtts).toFixed(1)} ms`
+                });
+            } else {
+                hops.push({
+                    hop, ip: '*', hostname: '请求超时',
+                    loss: '100.0%', sent: String(sent),
+                    best: '*', avg: '*', worst: '*'
+                });
+            }
+        }
+    }
+    // 解析 Linux/Mac traceroute 格式
+    // 例: " 1  192.168.1.1 (192.168.1.1)  0.5 ms  0.4 ms  0.6 ms"
+    else if (format === 'traceroute') {
+        const traceLineRe = /^\s*(\d+)\s+(.+)$/;
+        for (const line of lines) {
+            const m = line.match(traceLineRe);
+            if (!m) continue;
+            const hop = parseInt(m[1]);
+            const rest = m[2];
+            const ipMatch = rest.match(/\(([\d.]+)\)/) || rest.match(/(\d+\.\d+\.\d+\.\d+)/);
+            const rttMatches = [...rest.matchAll(/([\d.]+)\s*ms/g)];
+            const stars = (rest.match(/\*/g) || []).length;
+            const ip = ipMatch ? ipMatch[1] : '*';
+            const rtts = rttMatches.map(r => parseFloat(r[1]));
+            const sent = 3;
+            const lossRate = stars >= 3 ? '100.0%' : `${((stars / 3) * 100).toFixed(1)}%`;
+
+            if (rtts.length > 0) {
+                hops.push({
+                    hop, ip, hostname: ip,
+                    loss: lossRate, sent: String(sent),
+                    best: `${Math.min(...rtts).toFixed(1)} ms`,
+                    avg: `${(rtts.reduce((a, b) => a + b, 0) / rtts.length).toFixed(1)} ms`,
+                    worst: `${Math.max(...rtts).toFixed(1)} ms`
+                });
+            } else if (stars > 0) {
+                hops.push({
+                    hop, ip: '*', hostname: '* * *',
+                    loss: '100.0%', sent: String(sent),
+                    best: '*', avg: '*', worst: '*'
+                });
+            }
+        }
+    }
+
+    if (hops.length === 0) return null;
+
+    const validLatencies = hops.map(h => parseFloat(h.avg)).filter(v => !isNaN(v));
+    const avgLatency = validLatencies.length > 0
+        ? (validLatencies.reduce((a, b) => a + b, 0) / validLatencies.length).toFixed(1)
+        : '0.0';
+    const validLosses = hops.map(h => parseFloat(h.loss)).filter(v => !isNaN(v));
+    const avgLoss = validLosses.length > 0
+        ? (validLosses.reduce((a, b) => a + b, 0) / validLosses.length).toFixed(1)
+        : '0.0';
+
+    return {
+        target: target || hops[hops.length - 1].ip,
+        mode: 'real-pasted',
+        format,
+        hops,
+        summary: {
+            avgLoss: `${avgLoss}%`,
+            avgLatency: `${avgLatency} ms`,
+            totalHops: hops.length
+        }
+    };
+}
+
+// 渲染粘贴解析的 MTR 结果到现有 UI
+function renderPastedMTR(mtrData) {
+    mtrState.client = mtrData;
+    // 切到客户端视角并渲染
+    switchMtrTab('client');
+    renderMtrByMode('client');
+    analyzeMtrComparison();
+    setStatus('mtrStatus', 'success', '已升级为真实数据');
+}
+
+// Tab 切换
+function switchMtrTab(mode) {
+    document.querySelectorAll('.mtr-tab').forEach(tab => {
+        const isActive = tab.dataset.mode === mode;
+        tab.style.borderBottom = isActive ? '2px solid #58a6ff' : '2px solid transparent';
+        tab.style.color = isActive ? '#58a6ff' : '#8b949e';
+        tab.style.fontWeight = isActive ? '500' : '400';
+        tab.classList.toggle('active', isActive);
+    });
+    $('#mtrServerPanel').style.display = mode === 'server' ? 'block' : 'none';
+    $('#mtrClientPanel').style.display = mode === 'client' ? 'block' : 'none';
+    $('#mtrComparePanel').style.display = mode === 'compare' ? 'block' : 'none';
+
+    if (mode === 'server' || mode === 'client') {
+        renderMtrByMode(mode);
+    } else if (mode === 'compare') {
+        analyzeMtrComparison();
+    }
+}
+
+// 复制命令（带目标域名）
+window.copyMtrCmd = function(platform) {
+    const target = ($('#targetDomain').value.trim() || diagnosisResult.target || 'edgeone.ai')
+        .replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    const cmd = platform === 'win'
+        ? `tracert -d -h 30 ${target}`
+        : `sudo mtr -r -w -c 10 -n ${target}`;
+    navigator.clipboard.writeText(cmd).then(() => {
+        showToast(`已复制：${cmd}`);
+    }).catch(() => {
+        // fallback
+        const ta = document.createElement('textarea');
+        ta.value = cmd;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        showToast(`已复制：${cmd}`);
+    });
+};
 
 // ==================== 模块5: 下载测速 ====================
 async function detectDownloadSpeed(domain) {
@@ -1336,36 +1832,8 @@ async function startDiagnosis() {
 
     // Step 1: 客户端信息
     updateProgress(progress, steps[0].name);
-    const clientInfoOk = await detectClientInfo();
+    await detectClientInfo();
     progress += steps[0].weight;
-
-    // 如果获取不到公网IP，中止后续探测
-    if (!clientInfoOk) {
-        updateProgress(progress, '⚠️ 无法获取公网IP，探测已中止');
-        $('#progressSection').style.display = 'none';
-        
-        // 显示提示信息
-        const alertDiv = document.createElement('div');
-        alertDiv.className = 'ip-fail-alert';
-        alertDiv.innerHTML = `
-            <div style="background: var(--card-bg); border: 1px solid var(--error); border-radius: 12px; padding: 20px; margin: 16px 0; text-align: center;">
-                <div style="font-size: 32px; margin-bottom: 12px;">⚠️</div>
-                <div style="font-size: 16px; font-weight: 600; color: var(--error); margin-bottom: 8px;">无法获取公网IP</div>
-                <div style="font-size: 14px; color: var(--text-secondary); line-height: 1.6;">
-                    未能获取到您的公网IP地址，后续网络探测无法继续。<br>
-                    请检查您的网络连接是否正常，或稍后重试。
-                </div>
-            </div>
-        `;
-        // 移除之前的告警（如果有）
-        const oldAlert = document.querySelector('.ip-fail-alert');
-        if (oldAlert) oldAlert.remove();
-        $('#resultsSection').insertBefore(alertDiv, $('#resultsSection').firstChild);
-
-        isRunning = false;
-        $('#startDiagnosis').disabled = false;
-        return;
-    }
 
     // 移除之前可能存在的IP获取失败告警
     const oldAlert = document.querySelector('.ip-fail-alert');
@@ -1434,6 +1902,28 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    // 将 MTR 卡片移动到最后并默认折叠
+    const diagnosisGrid = document.querySelector('.diagnosis-grid');
+    const mtrCard = $('#mtrCard');
+    const mtrCardBody = $('#mtrCardBody');
+    const toggleMtrCardBtn = $('#toggleMtrCardBtn');
+    if (diagnosisGrid && mtrCard) {
+        diagnosisGrid.appendChild(mtrCard);
+    }
+    if (mtrCardBody && toggleMtrCardBtn) {
+        const updateMtrToggle = (expanded) => {
+            mtrCardBody.style.display = expanded ? 'block' : 'none';
+            toggleMtrCardBtn.textContent = expanded ? '折叠' : '展开';
+            toggleMtrCardBtn.style.color = expanded ? '#58a6ff' : '#8b949e';
+            toggleMtrCardBtn.style.borderColor = expanded ? '#58a6ff' : '#30363d';
+        };
+        updateMtrToggle(false);
+        toggleMtrCardBtn.addEventListener('click', () => {
+            const expanded = mtrCardBody.style.display === 'none';
+            updateMtrToggle(expanded);
+        });
+    }
+
     // 开始诊断
     $('#startDiagnosis').addEventListener('click', startDiagnosis);
 
@@ -1484,4 +1974,103 @@ document.addEventListener('DOMContentLoaded', () => {
     $('#closeReport').addEventListener('click', () => {
         $('#reportSection').style.display = 'none';
     });
+
+    // 真实 MTR 粘贴解析
+    const parseBtn = $('#parseMtrBtn');
+    if (parseBtn) {
+        parseBtn.addEventListener('click', () => {
+            const text = $('#mtrPasteInput').value;
+            const hint = $('#mtrParseHint');
+            if (!text.trim()) {
+                hint.textContent = '⚠️ 请先粘贴 mtr 或 tracert 命令的输出';
+                hint.style.color = '#f0883e';
+                return;
+            }
+            const result = parsePastedMTR(text);
+            if (!result) {
+                hint.textContent = '❌ 无法识别格式，请确保粘贴的是完整的 mtr / tracert / traceroute 输出';
+                hint.style.color = '#f85149';
+                return;
+            }
+            renderPastedMTR(result);
+            hint.textContent = `✓ 已解析 ${result.hops.length} 跳真实客户端路由（格式: ${result.format}），自动切换到对比视角查看判断结论`;
+            hint.style.color = '#7ee787';
+            // 解析成功后自动切到对比视角
+            setTimeout(() => switchMtrTab('compare'), 800);
+        });
+    }
+    const clearBtn = $('#clearMtrBtn');
+    if (clearBtn) {
+        clearBtn.addEventListener('click', () => {
+            $('#mtrPasteInput').value = '';
+            $('#mtrParseHint').textContent = '';
+        });
+    }
+
+    // 视角 Tab 切换
+    document.querySelectorAll('.mtr-tab').forEach(tab => {
+        tab.addEventListener('click', () => switchMtrTab(tab.dataset.mode));
+    });
+
+    // 配置 mtr-api 地址
+    const configBtn = $('#configMtrApiBtn');
+    if (configBtn) {
+        // 初始化显示：localStorage 优先，其次 CONFIG 默认值
+        const saved = localStorage.getItem('mtrApiBase');
+        if (saved !== null) {
+            CONFIG.mtrApiBase = saved;
+        }
+        if (CONFIG.mtrApiBase) {
+            $('#mtrApiUrl').textContent = CONFIG.mtrApiBase;
+            $('#mtrApiUrl').style.color = '#7ee787';
+        }
+        configBtn.addEventListener('click', () => {
+            const cur = CONFIG.mtrApiBase || '';
+            const url = prompt('请输入 mtr-api 后端地址（例：http://14.116.239.35:3089）\n留空则清除配置', cur);
+            if (url === null) return;
+            CONFIG.mtrApiBase = url.trim();
+            if (CONFIG.mtrApiBase) {
+                localStorage.setItem('mtrApiBase', CONFIG.mtrApiBase);
+                $('#mtrApiUrl').textContent = CONFIG.mtrApiBase;
+                $('#mtrApiUrl').style.color = '#7ee787';
+                showToast('已保存 mtr-api 地址，下次诊断生效');
+            } else {
+                localStorage.removeItem('mtrApiBase');
+                $('#mtrApiUrl').textContent = '未配置';
+                $('#mtrApiUrl').style.color = '#8b949e';
+            }
+        });
+    }
+
+    // 服务端单独拨测按钮
+    const probeBtn = $('#probeServerBtn');
+    if (probeBtn) {
+        probeBtn.addEventListener('click', async () => {
+            const target = ($('#targetDomain').value.trim() || diagnosisResult.target || '').replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+            if (!target) { showToast('请先输入诊断目标'); return; }
+            if (!CONFIG.mtrApiBase) { showToast('请先配置 mtr-api 后端地址'); return; }
+            probeBtn.textContent = '拨测中...';
+            probeBtn.disabled = true;
+            try {
+                const resp = await fetchWithTimeout(
+                    `${CONFIG.mtrApiBase}/mtr?target=${encodeURIComponent(target)}&protocol=auto&port=80`,
+                    {}, 60000
+                );
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const data = await resp.json();
+                if (data.error) throw new Error(data.error);
+                data.mode = 'server';
+                data.source = 'mtr-api';
+                mtrState.server = data;
+                renderMtrByMode('server');
+                analyzeMtrComparison();
+                showToast(`✓ 服务端拨测完成：${data.hops.length} 跳`);
+            } catch (e) {
+                showToast('❌ 服务端拨测失败：' + e.message);
+            } finally {
+                probeBtn.textContent = '从服务端拨测';
+                probeBtn.disabled = false;
+            }
+        });
+    }
 });

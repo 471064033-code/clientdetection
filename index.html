@@ -110,6 +110,18 @@
                                 <label>本地网络 IP</label>
                                 <span id="localExitIP">--</span>
                             </div>
+                            <div class="info-item">
+                                <label>主出口 IPv4</label>
+                                <span id="primaryIPv4">--</span>
+                            </div>
+                            <div class="info-item">
+                                <label>主出口 IPv6</label>
+                                <span id="primaryIPv6">--</span>
+                            </div>
+                            <div class="info-item" style="grid-column: 1 / -1;">
+                                <label>IP 差异说明</label>
+                                <span id="ipConsistencyNote" style="font-size:12px;">--</span>
+                            </div>
                             <div class="info-item" style="grid-column: 1 / -1;">
                                 <label>多源 IP 视角</label>
                                 <span id="multiSourceIPs" style="font-size:12px;">--</span>
@@ -175,7 +187,7 @@
                 <div class="card-body">
                     <div class="connect-summary">
                         <div class="info-item">
-                            <label>HTTP 状态码</label>
+                            <label>HTTP 状态码 <span title="若显示「可连通（无法读取状态码）」：表示 TCP/HTTPS 已成功握手，目标网站确实可达；只是浏览器同源策略 (CORS) 禁止 JavaScript 读取响应内容。这是浏览器安全机制，不是网络故障。" style="cursor:help; color:#58a6ff;">ⓘ</span></label>
                             <span id="httpStatus">--</span>
                         </div>
                         <div class="info-item">
@@ -198,14 +210,35 @@
                 </div>
             </div>
 
-            <!-- 模块4: MTR 路由追踪 -->
+            <!-- 模块4: MTR 路由追踪（双拨测形态） -->
             <div class="card" id="mtrCard">
                 <div class="card-header">
-                    <h2>🛤️ MTR 路由追踪</h2>
-                    <span class="status-badge" id="mtrStatus">等待中</span>
+                    <h2>🛤️ MTR 路由追踪 · 双拨测</h2>
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <button id="toggleMtrCardBtn" style="background:none; border:1px solid #30363d; color:#8b949e; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:12px;">展开</button>
+                        <span class="status-badge" id="mtrStatus">等待中</span>
+                    </div>
                 </div>
-                <div class="card-body">
+                <div class="card-body" id="mtrCardBody" style="display:none;">
+                    <!-- 视角切换 Tab -->
+                    <div id="mtrTabs" style="display:flex; gap:8px; margin-bottom:14px; border-bottom:1px solid #30363d;">
+                        <button class="mtr-tab active" data-mode="server" style="padding:10px 16px; background:none; border:none; border-bottom:2px solid #58a6ff; color:#58a6ff; cursor:pointer; font-size:13px; font-weight:500;">
+                            ① 服务端视角（mtr-api）
+                        </button>
+                        <button class="mtr-tab" data-mode="client" style="padding:10px 16px; background:none; border:none; border-bottom:2px solid transparent; color:#8b949e; cursor:pointer; font-size:13px;">
+                            ② 客户端视角（粘贴）
+                        </button>
+                        <button class="mtr-tab" data-mode="compare" style="padding:10px 16px; background:none; border:none; border-bottom:2px solid transparent; color:#8b949e; cursor:pointer; font-size:13px;">
+                            🔍 对比 & 判断
+                        </button>
+                    </div>
+
+                    <!-- 概要信息 -->
                     <div class="mtr-info">
+                        <div class="info-item">
+                            <label>当前视角</label>
+                            <span id="mtrCurrentMode" style="color:#58a6ff;">服务端</span>
+                        </div>
                         <div class="info-item">
                             <label>目标 IP</label>
                             <span id="mtrTarget">--</span>
@@ -223,7 +256,115 @@
                             <span id="mtrAvgLatency">--</span>
                         </div>
                     </div>
-                    <div class="table-container">
+
+                    <!-- ① 服务端视角面板 -->
+                    <div id="mtrServerPanel" class="mtr-panel">
+                        <div style="margin-bottom:12px; padding:10px 14px; background:rgba(56,139,253,0.1); border-left:3px solid #58a6ff; border-radius:4px;">
+                            <div style="color:#e6edf3; font-size:13px; line-height:1.6;">
+                                <strong>服务端视角</strong>：从部署 mtr-api 的服务器发起 TCP MTR 探测，反映<strong style="color:#58a6ff;">服务器→目标</strong>的链路质量。适合对照客户报告，做"我这边正常吗"的反向核对。
+                            </div>
+                            <div style="color:#8b949e; font-size:12px; margin-top:8px; line-height:1.7;">
+                                当前后端：<code id="mtrApiUrl" style="color:#7ee787;">未配置</code>
+                                <button id="configMtrApiBtn" style="margin-left:8px; background:none; border:1px solid #30363d; color:#58a6ff; padding:2px 10px; border-radius:4px; cursor:pointer; font-size:11px;">配置</button>
+                                <button id="probeServerBtn" style="margin-left:8px; background:#1f6feb; border:none; color:#fff; padding:4px 12px; border-radius:4px; cursor:pointer; font-size:12px;">从服务端拨测</button>
+                                <br>
+                                探测节点：<strong style="color:#e6edf3;">30.184.62.61</strong>（TencentOS / 出口 IP 170.106.101.170）<br>
+                                探测协议：<strong style="color:#e6edf3;">TCP SYN to port 80</strong>（云内 ICMP 受限，TCP 可穿越）
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- ② 客户端视角面板 -->
+                    <div id="mtrClientPanel" class="mtr-panel" style="display:none;">
+                        <div style="margin-bottom:12px; padding:10px 14px; background:rgba(35,134,54,0.12); border-left:3px solid #7ee787; border-radius:4px;">
+                            <div style="color:#e6edf3; font-size:13px; line-height:1.6;">
+                                <strong>客户端视角</strong>：在用户本地终端执行 mtr/tracert 命令并粘贴结果，反映<strong style="color:#7ee787;">用户客户端→目标</strong>的真实链路。这才是用户实际访问的路径。
+                            </div>
+                        </div>
+                        <div style="background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:10px; margin-bottom:8px;">
+                            <div style="color:#7ee787; font-size:12px; margin-bottom:4px;"># macOS / Linux</div>
+                            <code id="mtrCmdUnix" style="color:#e6edf3; font-family:Menlo,Monaco,monospace; font-size:13px;">sudo mtr -r -w -c 10 -n [目标]</code>
+                            <button onclick="copyMtrCmd('unix')" style="float:right; background:none; border:1px solid #30363d; color:#8b949e; padding:2px 8px; border-radius:4px; cursor:pointer; font-size:11px;">复制</button>
+                        </div>
+                        <div style="background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:10px; margin-bottom:12px;">
+                            <div style="color:#7ee787; font-size:12px; margin-bottom:4px;"># Windows（cmd 或 PowerShell）</div>
+                            <code id="mtrCmdWin" style="color:#e6edf3; font-family:Menlo,Monaco,monospace; font-size:13px;">tracert -d -h 30 [目标]</code>
+                            <button onclick="copyMtrCmd('win')" style="float:right; background:none; border:1px solid #30363d; color:#8b949e; padding:2px 8px; border-radius:4px; cursor:pointer; font-size:11px;">复制</button>
+                        </div>
+                        <textarea id="mtrPasteInput" placeholder="把 mtr / tracert 命令的完整输出粘贴到这里，会自动解析显示真实路由..." style="width:100%; min-height:140px; background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:6px; padding:10px; font-family:Menlo,Monaco,monospace; font-size:12px; resize:vertical; box-sizing:border-box;"></textarea>
+                        <div style="margin-top:10px; display:flex; gap:8px;">
+                            <button id="parseMtrBtn" style="background:#238636; border:none; color:#fff; padding:8px 16px; border-radius:6px; cursor:pointer; font-size:13px;">解析并展示真实路由</button>
+                            <button id="clearMtrBtn" style="background:none; border:1px solid #30363d; color:#8b949e; padding:8px 16px; border-radius:6px; cursor:pointer; font-size:13px;">清空</button>
+                        </div>
+                        <div id="mtrParseHint" style="margin-top:8px; color:#8b949e; font-size:12px;"></div>
+                    </div>
+
+                    <!-- ③ 对比判断面板 -->
+                    <div id="mtrComparePanel" class="mtr-panel" style="display:none;">
+                        <div id="mtrCompareEmpty" style="padding:20px; text-align:center; color:#8b949e; font-size:13px;">
+                            完成两个视角的拨测后，这里会自动给出判断结论
+                        </div>
+                        <div id="mtrCompareResult" style="display:none;">
+                            <!-- 双视角概要对比 -->
+                            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:16px;">
+                                <div style="padding:14px; background:rgba(56,139,253,0.08); border:1px solid #58a6ff; border-radius:8px;">
+                                    <div style="color:#58a6ff; font-size:12px; font-weight:500; margin-bottom:8px;">① 服务端 → 目标</div>
+                                    <div style="color:#e6edf3; font-size:13px; line-height:1.8;">
+                                        丢包率：<strong id="cmpServerLoss" style="color:#e6edf3;">--</strong><br>
+                                        平均延迟：<strong id="cmpServerLatency" style="color:#e6edf3;">--</strong><br>
+                                        总跳数：<strong id="cmpServerHops" style="color:#e6edf3;">--</strong>
+                                    </div>
+                                </div>
+                                <div style="padding:14px; background:rgba(35,134,54,0.1); border:1px solid #7ee787; border-radius:8px;">
+                                    <div style="color:#7ee787; font-size:12px; font-weight:500; margin-bottom:8px;">② 客户端 → 目标</div>
+                                    <div style="color:#e6edf3; font-size:13px; line-height:1.8;">
+                                        丢包率：<strong id="cmpClientLoss" style="color:#e6edf3;">--</strong><br>
+                                        平均延迟：<strong id="cmpClientLatency" style="color:#e6edf3;">--</strong><br>
+                                        总跳数：<strong id="cmpClientHops" style="color:#e6edf3;">--</strong>
+                                    </div>
+                                </div>
+                            </div>
+                            <!-- 自动判断结论 -->
+                            <div id="mtrVerdict" style="padding:14px; background:#1a1f2e; border:1px solid #2d3548; border-radius:8px;">
+                                <div style="color:#e6edf3; font-size:14px; font-weight:500; margin-bottom:10px;">📌 自动判断结论</div>
+                                <div id="mtrVerdictText" style="color:#8b949e; font-size:13px; line-height:1.7;">--</div>
+                            </div>
+                            <!-- 判断方法表 -->
+                            <details style="margin-top:12px;">
+                                <summary style="cursor:pointer; color:#58a6ff; font-size:13px; padding:8px 0;">📖 排查方法论（点击展开）</summary>
+                                <div style="margin-top:8px; padding:12px; background:#0d1117; border:1px solid #30363d; border-radius:6px;">
+                                    <table style="width:100%; border-collapse:collapse; font-size:12px;">
+                                        <thead>
+                                            <tr style="background:#161b22;">
+                                                <th style="padding:8px; text-align:left; color:#8b949e; border-bottom:1px solid #30363d;">服务端</th>
+                                                <th style="padding:8px; text-align:left; color:#8b949e; border-bottom:1px solid #30363d;">客户端</th>
+                                                <th style="padding:8px; text-align:left; color:#8b949e; border-bottom:1px solid #30363d;">结论</th>
+                                                <th style="padding:8px; text-align:left; color:#8b949e; border-bottom:1px solid #30363d;">下一步</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody style="color:#e6edf3;">
+                                            <tr><td style="padding:8px; border-bottom:1px solid #21262d;">✅ 正常</td><td style="padding:8px; border-bottom:1px solid #21262d;">✅ 正常</td><td style="padding:8px; border-bottom:1px solid #21262d; color:#7ee787;">不是网络问题</td><td style="padding:8px; border-bottom:1px solid #21262d;">检查应用层（HTTP 状态、证书、CDN 配置）</td></tr>
+                                            <tr><td style="padding:8px; border-bottom:1px solid #21262d;">✅ 正常</td><td style="padding:8px; border-bottom:1px solid #21262d;">❌ 异常</td><td style="padding:8px; border-bottom:1px solid #21262d; color:#f0883e;">客户端本地链路问题</td><td style="padding:8px; border-bottom:1px solid #21262d;">看客户端 mtr 中具体哪一跳异常：本地网关/运营商/跨国出口</td></tr>
+                                            <tr><td style="padding:8px; border-bottom:1px solid #21262d;">❌ 异常</td><td style="padding:8px; border-bottom:1px solid #21262d;">✅ 正常</td><td style="padding:8px; border-bottom:1px solid #21262d; color:#f0883e;">服务端→目标路径异常</td><td style="padding:8px; border-bottom:1px solid #21262d;">服务器到目标的中间链路问题，与终端用户无关</td></tr>
+                                            <tr><td style="padding:8px;">❌ 异常</td><td style="padding:8px;">❌ 异常</td><td style="padding:8px; color:#f85149;">目标侧/共同链路问题</td><td style="padding:8px;">找两条路径共有的异常跳，通常是目标 CDN 节点或骨干</td></tr>
+                                        </tbody>
+                                    </table>
+                                    <div style="margin-top:12px; padding-top:12px; border-top:1px solid #30363d; color:#8b949e; font-size:12px; line-height:1.7;">
+                                        <strong style="color:#e6edf3;">判断阈值参考：</strong><br>
+                                        • 丢包：&lt;1% 正常，1-5% 偶发，&gt;5% 异常，&gt;30% 严重<br>
+                                        • 延迟：同省 &lt;30ms，跨省 30-80ms，跨国 100-300ms，&gt;500ms 异常<br>
+                                        • 抖动：max-min &gt; 3×avg 表示链路抖动严重
+                                    </div>
+                                </div>
+                            </details>
+                        </div>
+                    </div>
+
+                    <!-- 数据表格 -->
+                    <div class="table-container" style="margin-top:14px;">
+                        <div style="color:#8b949e; font-size:12px; margin-bottom:6px;">
+                            当前展示：<span id="mtrTableLabel" style="color:#58a6ff;">服务端视角</span>
+                        </div>
                         <table class="data-table" id="mtrTable">
                             <thead>
                                 <tr>
@@ -241,6 +382,27 @@
                             </tbody>
                         </table>
                     </div>
+
+                    <details style="margin-top:12px; background:#0d1117; border:1px solid #30363d; border-radius:8px; padding:10px 12px;">
+                        <summary style="cursor:pointer; color:#58a6ff; font-size:13px; font-weight:500;">📱 手机端操作指南（按需展开）</summary>
+                        <div style="margin-top:10px; color:#8b949e; font-size:12px; line-height:1.8;">
+                            <div style="margin-bottom:10px;">
+                                <strong style="color:#e6edf3;">Android（优先）</strong><br>
+                                1. 安装 Termux，执行：<code style="color:#7ee787;">pkg update && pkg install mtr traceroute</code><br>
+                                2. 执行：<code style="color:#7ee787;">mtr -r -w -c 10 -n [目标域名]</code><br>
+                                3. 若权限或环境限制导致 mtr 失败，改用：<code style="color:#7ee787;">traceroute -n [目标域名]</code><br>
+                                4. 把终端输出粘贴到上方“客户端视角”文本框并点击解析。
+                            </div>
+                            <div style="margin-bottom:10px;">
+                                <strong style="color:#e6edf3;">iOS（建议替代方案）</strong><br>
+                                iOS 原生环境一般无法直接执行 mtr，建议使用可导出文本的 traceroute App，或采用“同网电脑代测”方案。
+                            </div>
+                            <div>
+                                <strong style="color:#e6edf3;">同网电脑代测（通用推荐）</strong><br>
+                                手机开热点 / 同 Wi-Fi，电脑接入同网络后执行：<code style="color:#7ee787;">sudo mtr -r -w -c 10 -n [目标域名]</code>，再粘贴结果。
+                            </div>
+                        </div>
+                    </details>
                 </div>
             </div>
 
