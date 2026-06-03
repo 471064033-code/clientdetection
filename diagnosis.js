@@ -896,33 +896,50 @@ async function detectMTR(targetIP, domain) {
 
     try {
         let mtrData = null;
+        const target = targetIP || domain;
 
         // 尝试调用后端 MTR API
         if (CONFIG.mtrApiBase) {
             try {
                 const resp = await fetchWithTimeout(
-                    `${CONFIG.mtrApiBase}/mtr?target=${targetIP || domain}`,
-                    {}, 30000
+                    `${CONFIG.mtrApiBase}/mtr?target=${encodeURIComponent(target)}`,
+                    {}, 60000 // MTR 需要较长超时（mtr -c 10 可能需要 30-50s）
                 );
-                mtrData = await resp.json();
+                if (resp.ok) {
+                    mtrData = await resp.json();
+                    if (mtrData.error) {
+                        console.warn('MTR API returned error:', mtrData.error);
+                        mtrData = null;
+                    }
+                }
             } catch (e) {
-                console.warn('MTR API call failed, using simulated data');
+                console.warn('MTR API call failed:', e.message);
             }
         }
 
-        // 如果没有后端API或调用失败，使用前端模拟探测
+        // 如果没有后端 API 或调用失败，使用浏览器端真实探测（有限能力）
         if (!mtrData) {
-            mtrData = await simulateMTR(targetIP || domain);
+            mtrData = await browserTraceroute(target);
         }
 
         // 更新UI
-        $('#mtrTarget').textContent = targetIP || domain;
+        $('#mtrTarget').textContent = target;
         $('#mtrHops').textContent = mtrData.hops.length;
         $('#mtrLoss').textContent = mtrData.summary.avgLoss;
         $('#mtrAvgLatency').textContent = mtrData.summary.avgLatency;
 
         const tbody = $('#mtrTableBody');
         tbody.innerHTML = '';
+
+        // 如果是浏览器端探测，显示提示标记
+        if (mtrData.mode === 'browser') {
+            const infoTr = document.createElement('tr');
+            infoTr.innerHTML = `<td colspan="8" style="text-align:center; color:#f0883e; font-size:12px; padding:8px;">
+                ⚠️ 浏览器端探测（仅最终跳可达性 + 延迟，中间路由需部署 MTR API 服务获取）
+            </td>`;
+            tbody.appendChild(infoTr);
+        }
+
         mtrData.hops.forEach(hop => {
             const tr = document.createElement('tr');
             const lossClass = parseFloat(hop.loss) === 0 ? 'loss-ok' : 
@@ -950,56 +967,137 @@ async function detectMTR(targetIP, domain) {
     }
 }
 
-// 前端模拟 MTR（通过多次HTTP请求估算延迟）
-async function simulateMTR(target) {
+// 浏览器端真实探测：通过多次 HTTP 请求测量到目标的 RTT
+// 这不是传统 traceroute，但能提供：
+// 1. 到目标的真实延迟（多次采样取 best/avg/worst）
+// 2. 丢包率（请求失败比例）
+// 3. DNS 解析路径上的 IP 信息
+async function browserTraceroute(target) {
     const hops = [];
+    const PROBE_COUNT = 10;
     
-    // 注意：真正的 MTR 需要服务端执行，这里通过 HTTP timing 做简单模拟
-    // 实际部署时应调用后端 MTR API
-    const simulatedHops = [
-        { ip: '192.168.1.1', hostname: 'gateway', base: 1 },
-        { ip: '10.0.0.1', hostname: 'isp-gw-1', base: 3 },
-        { ip: '120.232.0.1', hostname: 'core-router-1', base: 5 },
-        { ip: '120.232.1.1', hostname: 'backbone-1', base: 8 },
-        { ip: '183.60.0.1', hostname: 'backbone-2', base: 12 },
-        { ip: '14.18.100.1', hostname: 'cdn-edge-gw', base: 15 },
-        { ip: '14.18.100.50', hostname: 'cdn-node-1', base: 18 },
-        { ip: target, hostname: target, base: 20 },
-    ];
+    // 判断 target 是否为域名（可以发 HTTP 请求）
+    const isDomain = !/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(target);
+    
+    // 尝试通过 DNS 获取中间信息
+    let resolvedIPs = [];
+    if (isDomain) {
+        try {
+            const dnsResp = await fetchWithTimeout(
+                `https://dns.alidns.com/resolve?name=${target}&type=A`,
+                { headers: { 'Accept': 'application/dns-json' } }, 5000
+            );
+            const dnsData = await dnsResp.json();
+            if (dnsData.Answer) {
+                resolvedIPs = dnsData.Answer
+                    .filter(a => a.type === 1 || a.type === 5)
+                    .map(a => ({ type: a.type === 5 ? 'CNAME' : 'A', value: a.data }));
+            }
+        } catch (e) { /* ignore */ }
+    }
 
-    for (let i = 0; i < simulatedHops.length; i++) {
-        const hop = simulatedHops[i];
-        const jitter = Math.random() * 5;
-        const best = (hop.base + Math.random() * 2).toFixed(1);
-        const avg = (hop.base + 2 + jitter).toFixed(1);
-        const worst = (hop.base + 5 + jitter * 2).toFixed(1);
-        const loss = i === 2 ? '0.0%' : (Math.random() < 0.9 ? '0.0%' : `${(Math.random() * 5).toFixed(1)}%`);
+    // 获取本地网关信息（通过 WebRTC 已获取的 localIP）
+    const localGateway = diagnosisResult.clientInfo && diagnosisResult.clientInfo.localIPs 
+        ? diagnosisResult.clientInfo.localIPs[0] : null;
+    
+    if (localGateway) {
+        // 跳 1：本地网关（估算，延迟通常 < 1ms）
+        hops.push({
+            hop: 1,
+            ip: localGateway.replace(/\.\d+$/, '.1'),
+            hostname: 'local-gateway (推断)',
+            loss: '0.0%',
+            sent: '-',
+            best: '< 1 ms',
+            avg: '< 1 ms',
+            worst: '< 1 ms'
+        });
+    }
+
+    // CNAME 链路展示（如果有）
+    const cnameHops = resolvedIPs.filter(r => r.type === 'CNAME');
+    cnameHops.forEach((cname, idx) => {
+        hops.push({
+            hop: hops.length + 1,
+            ip: cname.value,
+            hostname: `CNAME → ${cname.value}`,
+            loss: '-',
+            sent: '-',
+            best: '-',
+            avg: '-',
+            worst: '-'
+        });
+    });
+
+    // 最终跳：通过多次 HTTP 请求真实测量 RTT 和丢包
+    const targetUrl = isDomain ? `https://${target}` : `http://${target}`;
+    const latencies = [];
+    let failCount = 0;
+
+    for (let i = 0; i < PROBE_COUNT; i++) {
+        try {
+            const start = performance.now();
+            await fetch(targetUrl, {
+                method: 'HEAD',
+                mode: 'no-cors',
+                cache: 'no-store'
+            });
+            const elapsed = performance.now() - start;
+            latencies.push(elapsed);
+        } catch (e) {
+            failCount++;
+        }
+        // 间隔 200ms 避免浏览器限流
+        if (i < PROBE_COUNT - 1) await sleep(200);
+    }
+
+    const lossRate = ((failCount / PROBE_COUNT) * 100).toFixed(1);
+    
+    if (latencies.length > 0) {
+        const best = Math.min(...latencies).toFixed(1);
+        const worst = Math.max(...latencies).toFixed(1);
+        const avg = (latencies.reduce((a, b) => a + b, 0) / latencies.length).toFixed(1);
+        const finalIP = resolvedIPs.find(r => r.type === 'A')?.value || target;
 
         hops.push({
-            hop: i + 1,
-            ip: hop.ip,
-            hostname: hop.hostname,
-            loss: loss,
-            sent: '10',
+            hop: hops.length + 1,
+            ip: finalIP,
+            hostname: isDomain ? target : finalIP,
+            loss: `${lossRate}%`,
+            sent: String(PROBE_COUNT),
             best: `${best} ms`,
             avg: `${avg} ms`,
             worst: `${worst} ms`
         });
-
-        await sleep(100); // 模拟逐跳显示效果
+    } else {
+        // 全部失败
+        const finalIP = resolvedIPs.find(r => r.type === 'A')?.value || target;
+        hops.push({
+            hop: hops.length + 1,
+            ip: finalIP,
+            hostname: isDomain ? target : finalIP,
+            loss: '100.0%',
+            sent: String(PROBE_COUNT),
+            best: '* ms',
+            avg: '* ms',
+            worst: '* ms'
+        });
     }
 
-    // 计算摘要
-    const losses = hops.map(h => parseFloat(h.loss));
-    const avgs = hops.map(h => parseFloat(h.avg));
-    
+    // 摘要
+    const validLatencies = latencies.length > 0 ? latencies : [0];
+    const avgLatency = (validLatencies.reduce((a, b) => a + b, 0) / validLatencies.length).toFixed(1);
+
     return {
         target,
+        mode: 'browser', // 标记为浏览器端探测
         hops,
         summary: {
-            avgLoss: `${(losses.reduce((a, b) => a + b, 0) / losses.length).toFixed(1)}%`,
-            avgLatency: `${(avgs.reduce((a, b) => a + b, 0) / avgs.length).toFixed(1)} ms`
-        }
+            avgLoss: `${lossRate}%`,
+            avgLatency: `${avgLatency} ms`,
+            totalHops: hops.length
+        },
+        note: '浏览器安全限制，仅能探测最终跳。完整路由路径需部署 MTR API 后端服务。'
     };
 }
 
